@@ -1,0 +1,15 @@
+[package]
+name = "statenode"
+version = "0.0.0"
+edition = "2024"
+description = "A graph-based runtime and state machine engine for LLM agent workflows."
+license = "MIT OR Apache-2.0"
+
+exclude = [
+  ".gitignore",
+  ".github",
+  "README.md"
+]
+
+[dependencies]
+
