@@ -1,15 +1,34 @@
-[package]
-name = "statenode"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
-description = "A graph-based runtime and state machine engine for LLM agent workflows."
+rust-version = "1.94.0"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/chmodas/statenode"
+description = "A graph-based runtime and state machine engine for LLM agent workflows."
 
-exclude = [
-  ".gitignore",
-  ".github",
-  "README.md"
-]
+[workspace.dependencies]
+proptest = "1"
+test-strategy = "0.4"
+tokio = { version = "1", default-features = false }
+tower = { version = "0.5", default-features = false }
 
-[dependencies]
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
 
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_docs_in_private_items = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+await_holding_lock = "deny"
+indexing_slicing = "deny"
