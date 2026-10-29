@@ -1,6 +1,13 @@
 # Rust
 /target
 
+# Coverage
+lcov.info
+coverage/
+
+# Environment
+.env
+
 # IDE
 
 ## IntelliJ

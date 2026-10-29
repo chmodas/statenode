@@ -9,17 +9,59 @@ The project maintains strict code quality and consistency through automated enfo
 - **Formatting:** [rustfmt](https://github.com/rust-lang/rustfmt/blob/main/Configurations.md) (configured via `rustfmt.toml`).
 - **Linting:** [clippy](https://github.com/rust-lang/rust-clippy) (configured via `clippy.toml`).
 
-Before considering implementation complete, ensure your code is compliant:
+The workspace builds on its minimum supported Rust, pinned in [rust-toolchain.toml](rust-toolchain.toml). A nightly toolchain, pinned by date in `.github/nightly-version`, is used for formatting and coverage only. That file is the only place the date is written; the commands below read it through `$NIGHTLY`, so set it once per shell, from the repository root, and install the toolchain:
 
-- **Format code:** `cargo +nightly fmt` (pass `--check` if you only want to verify)
-- **Check for lints:** `cargo clippy --all-targets --all-features -- -D warnings`, and again with `--no-default-features` in place of `--all-features`, since some code is compiled only without the default features
+```sh
+export NIGHTLY="$(cat .github/nightly-version)"
+rustup toolchain install "$NIGHTLY" --profile minimal -c rustfmt,llvm-tools
+```
+
+Before considering implementation complete, run every gate exactly as CI does (`.github/workflows/ci.yml`), with `RUSTFLAGS="-D warnings"` exported as CI sets it for every job:
+
+- **Format:** `cargo +"$NIGHTLY" fmt --all --check` (drop `--check` to format)
+- **Lint:** `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and again with `--no-default-features` in place of `--all-features`, since some code is compiled only without the default features. Lints are configured once, in `[workspace.lints]` in the root `Cargo.toml`, and every crate inherits them with `[lints] workspace = true`, never loosening them.
+- **Test (MSRV):** `cargo test --workspace --all-features`, and again with `--no-default-features`
+- **Coverage:** see [Coverage](#coverage) below
+- **Docs:** `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --document-private-items`
+- **Licences and advisories:** `cargo deny check`
+- **Unused dependencies:** `cargo machete`
 
 ## Quality and testing
 
-Processing errors are unacceptable given the sensitive nature of our data. We treat robust, well-tested code as a non-negotiable requirement, maintaining a minimum code coverage of 95% across the repository; line coverage is the floor, not the ceiling. 
+Processing errors are unacceptable given the sensitive nature of our data. We treat robust, well-tested code as a non-negotiable requirement: **100% line coverage, 100% region coverage, and at least 95% branch coverage** of production code, enforced in CI.
 
 - **Philosophy:** Prioritise exhaustive edge-case handling over ‘happy path’ validation; logic must hold even under hostility.
-- **Verification:** Use `cargo llvm-cov` to generate coverage reports and ensure the 95% threshold is met before merging.
+- **Verification:** Run the coverage gate below before merging.
+
+### Coverage
+
+Coverage runs on the pinned nightly (`$NIGHTLY`, see above), merging an `--all-features` run with a `--no-default-features` run of each package, so code compiled only without a feature is measured too:
+
+```sh
+IGNORE='(^|/)tests/'
+cargo +"$NIGHTLY" llvm-cov clean --workspace
+cargo +"$NIGHTLY" llvm-cov --branch --no-report --workspace --all-features
+cargo +"$NIGHTLY" llvm-cov --branch --no-report --package <each package> --no-default-features
+cargo +"$NIGHTLY" llvm-cov report --branch --ignore-filename-regex "$IGNORE" --json --summary-only \
+  | .github/scripts/coverage-gate.sh
+```
+
+How the gate decides is documented in [coverage-gate.sh](.github/scripts/coverage-gate.sh). To find what is uncovered, use `cargo +"$NIGHTLY" llvm-cov report --branch --text --show-instantiations --ignore-filename-regex "$IGNORE"`.
+
+Region totals score each function by its **best single instantiation in a single test binary**; they do not merge instantiations the way line totals do. Write code so that 100% is reachable:
+
+- **Thin generics.** Generic functions stay short and branch-free; logic lives in non-generic helpers that every instantiation shares.
+- **No unreachable paths.** A lookup that cannot fail uses combinators (`.get(i).copied()`, `filter_map`, `get_mut(i).into_iter().for_each(..)`), never `?`, `let … else`, an `if let` without `else`, or `None => {}`, each of which leaves a region that can never run.
+- **No exclusions.** Nothing is marked `coverage(off)`. Code that cannot run is restructured until it can, or removed.
+- **Test code counts.** Inline unit-test modules are measured with the code they test, so test helpers must be fully covered too, and deterministically: a proptest strategy must reach every arm of the reference model it feeds on every run, not by luck.
+- **Doctests do not count.** Code covered only by a doctest also needs a unit or integration test.
+
+### Test placement
+
+- **Unit tests** live in the same file as the code they test, in a `mod tests { … }` at the end of the file, marked `#[cfg(test)]`.
+- **Test groups.** Inside `mod tests`, tests are grouped by the item they exercise, in the order the items appear in the module. Each group opens with a marker comment naming the item, padded with `-` to column 80, such as `// --- validate_name ---…`. A group's own helpers (strategies, expected-value functions) sit at the top of the group; helpers shared by several groups sit before the first marker.
+- **Shared fixtures.** Fixtures used by several modules' unit tests live in `src/testing.rs`, declared `#[cfg(test)] mod testing;`; like all test code they must be fully covered by the tests that use them.
+- **Integration tests** are one binary per file in `tests/`. Shared helpers live in `tests/support/common.rs`, pulled in with `mod support { pub mod common; }`; items not every binary uses carry `#[allow(dead_code)]`. Every run path of a generic function is covered in `tests/probe.rs`. Helpers return `Result` instead of unwrapping or indexing.
 
 ### Property-based testing
 
@@ -42,7 +84,7 @@ Property tests use [`test-strategy`](https://github.com/frozenlib/test-strategy)
 - **Structured inputs:** `#[derive(Arbitrary)]` on a documented struct, where one field can depend on another (`#[strategy(f(#other))]`), instead of `prop_flat_map` and tuple plumbing. Every field must be read somewhere, or `dead_code` fires.
 - **Imports:** `use proptest::prelude::*;` plus `use test_strategy::{Arbitrary, proptest};` (the explicit import shadows the prelude's `proptest!`).
 - **Gotchas:** a predicate taking a slice must use the expression form, `#[filter(pred(&#param))]`; format strings inside attributes use positional `{}`. `#[filter]` rejections are *local* (up to 65 536 per test) rather than *global* like `prop_assume!` (1 024), so a generator that degrades into mostly rejected inputs retries quietly instead of failing fast – keep filters for rare rejections and shape the strategy instead.
-- **Documentation:** document test code like any other code. The lints do not check `#[cfg(test)]` code or `tests/`, so reviewers must.
+- **Documentation:** document test code like any other code. The documentation lints do not check `#[cfg(test)]` code, so reviewers must.
 
 ### Generator standards
 
@@ -69,11 +111,15 @@ While PBT verifies logic, example-based tests define intent and boundaries. Use 
 
 We take the documentation seriously. All APIs – both public and private – must be fully documented. A developer should never have to guess the intent, context, or edge cases of a function or module.
 
+## Async closures
+
+Functions passed to `node::from_fn` are closures or `async fn`s returning futures (`Fn(..) -> Fut` with `Fut: Future + Send + 'static`). Both `|s, ctx| async move { .. }` and a capture-free `async |s, ctx| { .. }` work. A *capturing* `async` closure does not implement `Fn`, so a closure that needs captured values clones them into an `async move` block: `move |s, ctx| { let x = x.clone(); async move { .. } }`. Because `from_fn` runs before `add_node`, a closure that reads through its state parameter, or through `ctx.context()` with a non-unit context, must type that parameter (`s: Arc<State>`, `ctx: NodeContext<C>`).
+
 ## Commit convention
 
 Use [conventional commits](https://www.conventionalcommits.org/) with a capital letter after the colon. No scope.
 
-Format: `type: Message`
+Format: `type: Message`. CI checks every commit subject in a pull request against `^(ci|docs|feat|fix|perf|refactor|test): [A-Z]`.
 
 Types:
 - `ci:` – Changes to CI configuration files and scripts
