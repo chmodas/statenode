@@ -1,0 +1,46 @@
+# This configuration enforces strict supply-chain security for statenode using
+# --all-features across the dependency graph. It denies any dependencies with
+# security advisories (yanked, unsound, or unmaintained crates via RustSec),
+# blocks wildcard dependencies, denies duplicate crate versions, and restricts
+# package sources strictly to crates.io.
+#
+# Licensing is configured to permit standard permissive licences compatible with
+# statenode's MIT OR Apache-2.0 dual licence (requiring 90%+ detection confidence),
+# while skipping licence checks on private, unpublished workspace crates.
+#
+# See https://embarkstudios.github.io/cargo-deny/ for details.
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+private = { ignore = true }
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

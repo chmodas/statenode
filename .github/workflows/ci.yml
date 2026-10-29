@@ -1,0 +1,204 @@
+# Quality gates for every push to trunk and every pull request.
+#
+# The gates are grouped by toolchain: `check` runs on the MSRV and `nightly`
+# on the pinned nightly. Inside a job, every gate runs even when another gate
+# failed, so one failure never hides another, but no gate runs once setup has
+# failed.
+#
+# Branch protection requires exactly these checks, by job name: `Detect
+# changes`, `Check`, `Format and coverage` and `Commit messages`. Renaming a job
+# renames its check, so keep the names stable (and free of versions). A job
+# skipped by its `if:` counts as passing, which is why `Detect changes` itself
+# is required: if it fails, the jobs that depend on it are skipped.
+#
+# AGENTS.md lists the same commands; keep the two in step.
+
+name: CI
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded pull request runs are cancelled; every trunk commit gets a verdict.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # `bash -eo pipefail`: a failing command anywhere in a pipeline fails the step.
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Integration tests are excluded from coverage; inline unit-test modules
+  # are measured with the code they test (see AGENTS.md).
+  COVERAGE_IGNORE: '(^|/)tests/'
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Pull requests list their files through the API.
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      # Pushes are diffed with git, `before..trunk`, so the `before` commit
+      # must be local.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Skip the Rust jobs when only Markdown changed. `base` and `ref` stay
+      # unset: a push to trunk is then diffed against the commit before the
+      # push, and a first push lists every file.
+      - id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          # A file counts only if it matches every pattern: anything that is
+          # not Markdown, at any depth.
+          predicate-quantifier: every
+          filters: |
+            rust:
+              - '**'
+              - '!**/*.md'
+
+  check:
+    # Runs on the MSRV pinned in rust-toolchain.toml.
+    name: Check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.94.0
+          components: clippy
+      # Installed before rust-cache, which then leaves these binaries out of
+      # the cache.
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-deny,cargo-machete
+      - id: setup
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy (all features)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Clippy (no default features)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - name: Test (all features)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo test --workspace --all-features
+      - name: Test (no default features)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo test --workspace --no-default-features
+      - name: Docs
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features --document-private-items
+      - name: Licences and advisories
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo deny check
+      - name: Unused dependencies
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo machete
+
+  nightly:
+    name: Format and coverage
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: nightly
+        run: echo "toolchain=$(cat .github/nightly-version)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.nightly.outputs.toolchain }}
+          components: rustfmt, llvm-tools-preview
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-llvm-cov
+      - id: setup
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Format
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          NIGHTLY: ${{ steps.nightly.outputs.toolchain }}
+        run: cargo +"$NIGHTLY" fmt --all --check
+      - name: Measure (all features, then each package without default features)
+        id: measure
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          NIGHTLY: ${{ steps.nightly.outputs.toolchain }}
+        run: |
+          cargo +"$NIGHTLY" llvm-cov clean --workspace
+          cargo +"$NIGHTLY" llvm-cov --branch --no-report --workspace --all-features
+          # Per package, so features enabled by other members' dev-dependencies
+          # are not unified into the no-default-features build. The package
+          # list is computed first, so a failing `cargo metadata` fails the
+          # step instead of silently skipping the loop.
+          packages="$(cargo +"$NIGHTLY" metadata --no-deps --format-version 1 | jq -r '.packages[].name')"
+          if [ -z "$packages" ]; then
+            echo "no workspace packages found" >&2
+            exit 1
+          fi
+          for package in $packages; do
+            cargo +"$NIGHTLY" llvm-cov --branch --no-report --package "$package" --no-default-features
+          done
+      - name: Report and gate
+        if: ${{ !cancelled() && steps.measure.outcome == 'success' }}
+        env:
+          NIGHTLY: ${{ steps.nightly.outputs.toolchain }}
+        run: |
+          cargo +"$NIGHTLY" llvm-cov report --branch --ignore-filename-regex "$COVERAGE_IGNORE" \
+            --lcov --output-path lcov.info
+          cargo +"$NIGHTLY" llvm-cov report --branch --ignore-filename-regex "$COVERAGE_IGNORE" \
+            --json --summary-only | .github/scripts/coverage-gate.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: lcov
+          path: lcov.info
+          if-no-files-found: ignore
+
+  commits:
+    name: Commit messages
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check every commit subject
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='^(ci|docs|feat|fix|perf|refactor|test): [A-Z]'
+          # Collected first, so a failing `git log` fails the step.
+          subjects="$(git log --no-merges --format=%s "$BASE..$HEAD")"
+          status=0
+          while IFS= read -r subject; do
+            if ! grep -qE "$pattern" <<<"$subject"; then
+              echo "::error::Commit subject does not follow AGENTS.md: $subject"
+              status=1
+            fi
+          done <<<"$subjects"
+          exit "$status"
