@@ -4,7 +4,7 @@
 //!
 //! A node is planned when its trigger channel's version is newer than the
 //! version it saw when it last ran. The barrier gives every channel the step
-//! wrote one new version, and records what each node that ran has seen.
+//! that wrote one new version and records what each node that ran has seen.
 //!
 //! This is the only module tied to the scheduling algorithm. Non-generic, so
 //! every state type shares one implementation of the scheduling rules.
@@ -167,6 +167,7 @@ mod tests {
     use proptest::prelude::*;
     use test_strategy::{Arbitrary, proptest};
 
+    use std::collections::BTreeSet;
     use std::iter::once;
 
     use super::*;
@@ -273,18 +274,28 @@ mod tests {
             .collect()
     }
 
-    /// A random functional graph: each node writes at most one trigger.
+    /// A random graph: `START` leads to up to three random nodes, and each
+    /// node to up to two, as fan-out allows.
+    ///
+    /// Its wiring appends a fixed gadget of two nodes, `START → x → y → END`,
+    /// so the first step always writes one channel (`y`) and leaves another
+    /// (`x`) unwritten, whatever was drawn: the properties' test code takes
+    /// both arms of "was this channel written?" on every run.
     #[derive(Debug, Arbitrary)]
     struct Graph {
-        /// The number of nodes.
+        /// The number of random nodes.
         #[strategy(1usize..40)]
         len: usize,
-        /// For each node, the index (modulo `len`) of its successor, or `None` for
-        /// `END`.
-        #[strategy(prop::collection::vec(prop::option::of(0usize..1000), #len))]
-        successors: Vec<Option<usize>>,
-        /// The index (modulo `len`) of the start target.
-        start: usize,
+        /// For each node, the indices (modulo `len`) of its successors; `None`
+        /// is `END`.
+        #[strategy(prop::collection::vec(
+            prop::collection::btree_set(prop::option::of(0usize..1000), 0..=2),
+            #len
+        ))]
+        successors: Vec<BTreeSet<Option<usize>>>,
+        /// The indices (modulo `len`) of the start targets.
+        #[strategy(prop::collection::btree_set(0usize..1000, 1..=3))]
+        start: BTreeSet<usize>,
         /// How many steps to simulate: at least one, so the step loop always
         /// runs.
         #[strategy(1usize..60)]
@@ -292,15 +303,26 @@ mod tests {
     }
 
     impl Graph {
-        /// The graph's wiring.
+        /// The graph's wiring, with the gadget's `x` and `y` after the random
+        /// nodes. Each node's triggers are distinct, as a validated topology's
+        /// are.
         fn wiring(&self) -> Wiring {
-            wiring(
-                self.successors
-                    .iter()
-                    .map(|s| s.map(|t| t % self.len).into_iter().collect())
-                    .collect(),
-                vec![self.start % self.len],
-            )
+            let (x, y) = (self.len, self.len + 1);
+            // One closure for both uses, so the start targets, which are never
+            // empty, cover it.
+            let wrap = |t: usize| t % self.len;
+            let distinct = |targets: BTreeSet<usize>| targets.into_iter().collect::<Vec<_>>();
+            let successors = self
+                .successors
+                .iter()
+                .map(|targets| distinct(targets.iter().flatten().copied().map(wrap).collect()))
+                .chain([vec![y], Vec::new()])
+                .collect();
+            let start = distinct(self.start.iter().copied().map(wrap).collect())
+                .into_iter()
+                .chain(once(x))
+                .collect();
+            wiring(successors, start)
         }
     }
 
@@ -428,7 +450,7 @@ mod tests {
     fn a_barrier_without_writes_marks_what_ran_as_seen(graph: Graph) {
         let w = graph.wiring();
         let mut s = after(&w, graph.steps);
-        let ran: Vec<usize> = (0..graph.len).collect();
+        let ran: Vec<usize> = (0..w.names.len()).collect();
         s.barrier(&ran, Vec::new());
         prop_assert_eq!(s.versions_seen, s.versions);
     }

@@ -6,10 +6,11 @@ use crate::name::{NameError, NodeName};
 
 /// A graph could not be built.
 ///
-/// Invalid names and handles from another builder are rejected when they are
-/// passed in. The structural checks run in
-/// [`compile`](crate::GraphBuilder::compile), in the order the variants below
-/// are declared, and the first failure is reported.
+/// Names and edges are checked when they are passed in, in the order the
+/// eager variants are declared, from [`InvalidName`](Self::InvalidName) to
+/// [`DuplicateEdge`](Self::DuplicateEdge). The structural checks run in
+/// [`compile`](crate::GraphBuilder::compile), in the order the variants from
+/// [`Empty`](Self::Empty) on are declared. The first failure is reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BuildError {
@@ -22,17 +23,15 @@ pub enum BuildError {
     },
     /// A node handle from a different builder was used.
     ForeignNode,
+    /// The same edge was added twice.
+    DuplicateEdge {
+        /// The edge, as `from → to`, with `START` and `END` for the boundaries.
+        edge: String,
+    },
     /// The graph has no nodes.
     Empty,
     /// No edge leaves `START`.
     NoStartEdge,
-    /// More than one edge leaves `START`.
-    MultipleStartEdges,
-    /// More than one edge leaves a node.
-    MultipleOutgoing {
-        /// The node, the first by name with this problem.
-        node: NodeName,
-    },
     /// A node cannot be reached from `START`.
     Unreachable {
         /// The node, the first by name with this problem.
@@ -56,15 +55,9 @@ impl fmt::Display for BuildError {
             Self::ForeignNode => {
                 f.write_str("the node handle belongs to a different graph builder")
             }
+            Self::DuplicateEdge { edge } => write!(f, "the edge `{edge}` is declared twice"),
             Self::Empty => f.write_str("the graph has no nodes"),
             Self::NoStartEdge => f.write_str("no edge leaves START"),
-            Self::MultipleStartEdges => {
-                f.write_str("more than one edge leaves START, which is not supported yet")
-            }
-            Self::MultipleOutgoing { node } => write!(
-                f,
-                "more than one edge leaves node `{node}`, which is not supported yet"
-            ),
             Self::Unreachable { node } => write!(f, "node `{node}` cannot be reached from START"),
             Self::InvalidChannelName(e) => write!(f, "invalid channel name: {e}"),
             Self::DuplicateChannel { name } => {
@@ -101,18 +94,14 @@ mod tests {
                 BuildError::ForeignNode,
                 "the node handle belongs to a different graph builder",
             ),
+            (
+                BuildError::DuplicateEdge {
+                    edge: "plan → END".to_owned(),
+                },
+                "the edge `plan → END` is declared twice",
+            ),
             (BuildError::Empty, "the graph has no nodes"),
             (BuildError::NoStartEdge, "no edge leaves START"),
-            (
-                BuildError::MultipleStartEdges,
-                "more than one edge leaves START, which is not supported yet",
-            ),
-            (
-                BuildError::MultipleOutgoing {
-                    node: NodeName::new("plan").unwrap(),
-                },
-                "more than one edge leaves node `plan`, which is not supported yet",
-            ),
             (
                 BuildError::Unreachable {
                     node: NodeName::new("plan").unwrap(),

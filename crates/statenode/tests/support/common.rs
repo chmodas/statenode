@@ -3,6 +3,7 @@
 //! Each test binary compiles this module separately and uses only part of
 //! it, so the items some binaries do not use carry `#[allow(dead_code)]`.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use statenode::{
@@ -81,37 +82,80 @@ impl State for Trace {
     }
 }
 
-/// A graph that is a chain of `len` nodes, `n0 → n1 → … → n{len-1}`, ending
-/// either at `END` or with an edge back to node `cycle_to`.
+/// A graph of `len` nodes, `n0` to `n{len-1}`, wired by node index.
+///
+/// The spec does not remove repeats: an edge listed twice makes [`build`]
+/// fail with `DuplicateEdge`, so generators draw `start` and each node's
+/// `successors` from sets.
+///
+/// [`build`]: Self::build
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct ChainSpec {
+pub struct GraphSpec {
     /// The number of nodes.
     pub len: usize,
-    /// Where the last node's edge leads: `None` for `END`.
-    pub cycle_to: Option<usize>,
+    /// Where `START` leads: `Some(node)`, or `None` for `END`.
+    pub start: Vec<Option<usize>>,
+    /// Where each node leads, by node index: `Some(node)`, or `None` for
+    /// `END`.
+    pub successors: Vec<Vec<Option<usize>>>,
+    /// How many times each node yields to the runtime before it finishes, so
+    /// tests can vary the order in which a step's tasks complete. A node
+    /// with no entry does not yield.
+    pub yields: Vec<usize>,
+}
+
+/// What the reference interpreter expects of a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct Reference {
+    /// Every visit, by step, then by name.
+    pub visits: Vec<Visit>,
+    /// The final [`Trace`]'s visits, `"input"` first, if the run finishes.
+    pub trace: Vec<String>,
+    /// Whether the run reaches its recursion limit.
+    pub limited: bool,
 }
 
 #[allow(dead_code)]
-impl ChainSpec {
+impl GraphSpec {
     /// The name of node `i`.
     pub fn name(i: usize) -> String {
         format!("n{i}")
     }
 
-    /// Builds the graph. Every node records its visit in the run context and
-    /// appends its name to the state.
+    /// A chain of `len` nodes, `n0 → n1 → … → n{len-1}`, ending either at
+    /// `END` or with an edge back to node `cycle_to`.
+    pub fn chain(len: usize, cycle_to: Option<usize>) -> Self {
+        Self {
+            len,
+            start: vec![Some(0)],
+            successors: (0..len)
+                .map(|i| vec![if i + 1 < len { Some(i + 1) } else { cycle_to }])
+                .collect(),
+            yields: vec![0; len],
+        }
+    }
+
+    /// Builds the graph. Every node yields as often as `yields` says, then
+    /// records its visit in the run context and appends its name to the
+    /// state.
     ///
     /// # Errors
     ///
-    /// If `cycle_to` is not a node, or the builder rejects the graph.
+    /// If an edge names a node that does not exist, or the builder rejects
+    /// the graph.
     pub fn build(&self) -> Result<CompiledGraph<Trace, Recorder>, BoxError> {
         let mut g = GraphBuilder::<Trace, Recorder>::new();
         let ids = (0..self.len)
             .map(|i| {
+                let yields = self.yields.get(i).copied().unwrap_or_default();
                 g.add_node(
                     &Self::name(i),
-                    node::from_fn(|_s, ctx: NodeContext<Recorder>| async move {
+                    node::from_fn(move |_s, ctx: NodeContext<Recorder>| async move {
+                        for _ in 0..yields {
+                            tokio::task::yield_now().await;
+                        }
                         let node = ctx.name().as_str().to_owned();
                         ctx.context()
                             .lock()
@@ -126,21 +170,23 @@ impl ChainSpec {
                 )
             })
             .collect::<Result<Vec<NodeId>, _>>()?;
-        let mut from = Source::from(START);
-        for &id in &ids {
-            g.add_edge(from, id)?;
-            from = Source::from(id);
+        let node = |i: usize| ids.get(i).copied().ok_or("an edge names a missing node");
+        let target =
+            |end: Option<usize>| end.map_or(Ok(Target::from(END)), |i| node(i).map(Target::from));
+        for &end in &self.start {
+            g.add_edge(START, target(end)?)?;
         }
-        let last = match self.cycle_to {
-            Some(target) => Target::from(*ids.get(target).ok_or("cycle_to is not a node")?),
-            None => Target::from(END),
-        };
-        g.add_edge(from, last)?;
+        for (i, ends) in self.successors.iter().enumerate() {
+            let from = Source::from(node(i)?);
+            for &end in ends {
+                g.add_edge(from, target(end)?)?;
+            }
+        }
         Ok(g.compile()?)
     }
 
     /// Runs the graph with `limit`, returning the final state (or the error)
-    /// and every visit recorded.
+    /// and every visit recorded, in the order the tasks completed.
     ///
     /// # Errors
     ///
@@ -155,29 +201,55 @@ impl ChainSpec {
         Ok((result, visits))
     }
 
-    /// The naive reference interpreter: walks the edges one node at a time.
-    ///
-    /// Returns the visits, and whether the run hit the recursion limit.
-    pub fn interpret(&self, limit: u32) -> (Vec<Visit>, bool) {
+    /// The naive reference interpreter. Each step runs, in name order, every
+    /// node an edge leads to from the nodes of the step before, starting from
+    /// `START`'s targets, until no node is left or the limit is reached.
+    pub fn interpret(&self, limit: u32) -> Reference {
+        let limit = u64::from(limit);
+        let mut planned: BTreeSet<(String, usize)> = self
+            .start
+            .iter()
+            .flatten()
+            .map(|&i| (Self::name(i), i))
+            .collect();
         let mut visits = Vec::new();
-        let mut current = Some(0);
+        let mut trace = vec![String::from("input")];
         let mut step = 0;
-        while let Some(node) = current {
-            if step >= u64::from(limit) {
-                return (visits, true);
+        while !planned.is_empty() {
+            if step >= limit {
+                return Reference {
+                    visits,
+                    trace,
+                    limited: true,
+                };
             }
-            visits.push(Visit {
-                node: Self::name(node),
-                step,
-                remaining: u64::from(limit) - step - 1,
-            });
-            current = if node + 1 < self.len {
-                Some(node + 1)
-            } else {
-                self.cycle_to
-            };
+            for (node, _) in &planned {
+                visits.push(Visit {
+                    node: node.clone(),
+                    step,
+                    remaining: limit - step - 1,
+                });
+                trace.push(node.clone());
+            }
+            planned = planned
+                .iter()
+                .flat_map(|&(_, i)| self.successors.get(i).into_iter().flatten().flatten())
+                .map(|&j| (Self::name(j), j))
+                .collect();
             step += 1;
         }
-        (visits, false)
+        Reference {
+            visits,
+            trace,
+            limited: false,
+        }
     }
+}
+
+/// `visits` by step, then by name: the order the reference interpreter
+/// expects, since a run records visits in the order its tasks complete.
+#[allow(dead_code)]
+pub fn sorted(mut visits: Vec<Visit>) -> Vec<Visit> {
+    visits.sort_by(|a, b| (a.step, &a.node).cmp(&(b.step, &b.node)));
+    visits
 }

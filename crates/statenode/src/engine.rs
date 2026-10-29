@@ -4,13 +4,19 @@
 //! no node is planned. Each superstep has three phases:
 //!
 //! 1. **Plan** the step's tasks ([`Scheduler::plan`]).
-//! 2. **Execute** them against one immutable snapshot of the state.
+//! 2. **Execute** them concurrently, against one immutable snapshot of the
+//!    state, and wait for every one to finish.
 //! 3. **Apply** their updates in task-path order with
 //!    [`State::apply_step`], then close the step ([`Scheduler::barrier`]),
 //!    recording what it wrote so the next step can plan from it.
 //!
 //! Which tasks a step plans is decided by the scheduler in [`pregel`], the
 //! one part of the engine tied to the scheduling algorithm.
+//!
+//! The tasks of a step are polled together on the run's own task: this is
+//! concurrency, not parallelism. Nodes that wait, on a model or a tool, overlap;
+//! nodes that compute run one after another. A node that needs a thread of
+//! its own spawns one.
 //!
 //! Planning and execution change nothing, and the barrier runs only after the
 //! updates were applied, so a failing step leaves the scheduling state as it
@@ -24,6 +30,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use futures_util::future::join_all;
 use tower::ServiceExt as _;
 
 use crate::builder::ValidTopology;
@@ -78,10 +85,10 @@ impl<S: State, C: Send + Sync + 'static> CompiledGraph<S, C> {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Node`] if a node fails, [`RunError::Reduce`] if the
-    /// state rejects an update (including the input), and
-    /// [`RunError::RecursionLimit`] if a node is planned for the superstep the
-    /// recursion limit forbids.
+    /// Returns [`RunError::Node`] if a node fails (the first by name, if
+    /// several fail in one step), [`RunError::Reduce`] if the state rejects an
+    /// update (including the input), and [`RunError::RecursionLimit`] if a
+    /// node is planned for the superstep the recursion limit forbids.
     pub async fn invoke(&self, input: S::Update, config: RunConfig<C>) -> Result<S, RunError> {
         let inner = &*self.inner;
         let limit = config.recursion_limit;
@@ -103,27 +110,43 @@ impl<S: State, C: Send + Sync + 'static> CompiledGraph<S, C> {
             }
             let remaining_steps = u64::from(limit.get()) - step - 1;
 
-            let mut updates = Vec::with_capacity(tasks.len());
+            // One future per task, polled together. `join_all` returns their
+            // results in plan order, which is task-path order, so the first
+            // error collected is the first failing task by name, and the
+            // updates arrive sorted.
             let runs = tasks
                 .iter()
-                .filter_map(|&node| inner.nodes.get(node).zip(inner.wiring.names.get(node)));
-            for (node, name) in runs {
-                let task_path = TaskPath::pull(step, name.clone());
-                let ctx = NodeContext::new(
-                    task_path.clone(),
-                    name.clone(),
-                    remaining_steps,
-                    Arc::clone(&config.context),
-                );
-                let input = NodeInput {
-                    state: Arc::clone(&state),
-                    ctx,
-                };
-                let output = node.clone().oneshot(input).await.map_err(|source| {
-                    RunError::Node(NodeError::new(name.clone(), task_path.clone(), source))
-                })?;
-                updates.extend(output.into_update().map(|update| (task_path, update)));
-            }
+                .filter_map(|&node| inner.nodes.get(node).zip(inner.wiring.names.get(node)))
+                .map(|(node, name)| {
+                    let task_path = TaskPath::pull(step, name.clone());
+                    let ctx = NodeContext::new(
+                        task_path.clone(),
+                        name.clone(),
+                        remaining_steps,
+                        Arc::clone(&config.context),
+                    );
+                    let input = NodeInput {
+                        state: Arc::clone(&state),
+                        ctx,
+                    };
+                    async move {
+                        match node.clone().oneshot(input).await {
+                            Ok(output) => Ok((task_path, output)),
+                            Err(source) => Err(NodeError::new(name.clone(), task_path, source)),
+                        }
+                    }
+                });
+            let outputs = join_all(runs)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, NodeError>>()
+                .map_err(RunError::Node)?;
+            let updates = outputs
+                .into_iter()
+                .filter_map(|(task_path, output)| {
+                    output.into_update().map(|update| (task_path, update))
+                })
+                .collect();
 
             Arc::make_mut(&mut state)
                 .apply_step(updates)
@@ -148,6 +171,10 @@ pub enum RunError {
         limit: NonZeroU32,
     },
     /// A node returned an error.
+    ///
+    /// Every task of the step ran to completion. If several failed, this is
+    /// the first by task path, so by node name, whatever order they finished
+    /// in.
     Node(NodeError),
     /// The state rejected an update.
     Reduce(ReduceError),

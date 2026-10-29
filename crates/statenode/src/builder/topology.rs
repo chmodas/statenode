@@ -29,10 +29,40 @@ pub(crate) struct Topology {
     names: Vec<NodeName>,
     /// The same names, for duplicate detection.
     known: HashSet<NodeName>,
-    /// Edges, by node index: `None` as a source is `START`, and `None` as a
-    /// target is `END`. Visible to the builder, whose tests check what its
-    /// `add_edge` records.
-    pub(super) edges: Vec<(Option<usize>, Option<usize>)>,
+    /// Edges, in the order they were added. Visible to the builder, whose
+    /// tests check what its `add_edge` records.
+    pub(super) edges: Vec<Edge>,
+    /// The same edges, for duplicate detection.
+    declared: HashSet<Edge>,
+}
+
+/// An edge, by node index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct Edge {
+    /// The source node; `None` is `START`.
+    pub(super) from: Option<usize>,
+    /// The target node; `None` is `END`.
+    pub(super) to: Option<usize>,
+}
+
+impl Edge {
+    /// The edge as `from → to`, naming nodes by `names` and the boundaries
+    /// `START` and `END`.
+    fn describe(self, names: &[NodeName]) -> String {
+        format!(
+            "{} → {}",
+            end_name(names, self.from, "START"),
+            end_name(names, self.to, "END")
+        )
+    }
+}
+
+/// The name of the node at `index`, or `boundary` for `None` (or an index
+/// with no name, which a resolved edge never has).
+fn end_name<'a>(names: &'a [NodeName], index: Option<usize>, boundary: &'a str) -> &'a str {
+    index
+        .and_then(|i| names.get(i))
+        .map_or(boundary, NodeName::as_str)
 }
 
 impl Topology {
@@ -43,6 +73,7 @@ impl Topology {
             names: Vec::new(),
             known: HashSet::new(),
             edges: Vec::new(),
+            declared: HashSet::new(),
         }
     }
 
@@ -84,7 +115,8 @@ impl Topology {
     /// # Errors
     ///
     /// Returns [`BuildError::ForeignNode`] if either end is a handle from
-    /// another builder.
+    /// another builder, then [`BuildError::DuplicateEdge`] if the edge was
+    /// already added. A rejected edge is not recorded.
     pub(crate) fn add_edge(&mut self, from: Source, to: Target) -> Result<(), BuildError> {
         let from = match from {
             Source::Start => None,
@@ -94,7 +126,13 @@ impl Topology {
             Target::Node(node) => Some(self.resolve(node)?),
             Target::End => None,
         };
-        self.edges.push((from, to));
+        let edge = Edge { from, to };
+        if !self.declared.insert(edge) {
+            return Err(BuildError::DuplicateEdge {
+                edge: edge.describe(&self.names),
+            });
+        }
+        self.edges.push(edge);
         Ok(())
     }
 
@@ -115,7 +153,7 @@ impl Topology {
 
         let mut start_targets = Vec::new();
         let mut outgoing: Vec<Vec<Option<usize>>> = vec![Vec::new(); self.names.len()];
-        for &(from, to) in &self.edges {
+        for &Edge { from, to } in &self.edges {
             match from {
                 None => start_targets.push(to),
                 Some(node) => outgoing
@@ -127,19 +165,9 @@ impl Topology {
         if start_targets.is_empty() {
             return Err(BuildError::NoStartEdge);
         }
-        if start_targets.len() > 1 {
-            return Err(BuildError::MultipleStartEdges);
-        }
 
         let mut by_name: Vec<(&NodeName, usize)> = self.names.iter().zip(0..).collect();
         by_name.sort_unstable();
-
-        let branching = by_name
-            .iter()
-            .find(|&&(_, node)| outgoing.get(node).is_some_and(|edges| edges.len() > 1));
-        if let Some(&(name, _)) = branching {
-            return Err(BuildError::MultipleOutgoing { node: name.clone() });
-        }
 
         let reached = reachable(&start_targets, &outgoing, self.names.len());
         let unreachable = by_name
@@ -318,6 +346,7 @@ mod tests {
             known: HashSet::from_iter(names.clone()),
             names,
             edges: Vec::new(),
+            declared: HashSet::new(),
         };
         // Node 0 exists in both builders, so only the tag tells them apart.
         let own = NodeId {
@@ -336,6 +365,7 @@ mod tests {
         ] {
             prop_assert_eq!(t.add_edge(from, to), Err(BuildError::ForeignNode));
         }
+        prop_assert!(t.edges.is_empty() && t.declared.is_empty());
     }
 
     /// Every combination of this builder's ends is accepted, `START` or a
@@ -356,16 +386,100 @@ mod tests {
         for (from, to) in edges {
             assert_eq!(t.add_edge(from, to), Ok(()));
         }
+        let edge = |from, to| Edge { from, to };
         assert_eq!(
             t.edges,
             vec![
-                (None, Some(0)),
-                (Some(0), Some(1)),
-                (Some(1), None),
-                (None, None),
-                (Some(0), Some(0)),
+                edge(None, Some(0)),
+                edge(Some(0), Some(1)),
+                edge(Some(1), None),
+                edge(None, None),
+                edge(Some(0), Some(0)),
             ]
         );
+    }
+
+    /// An edge added a second time, wherever it falls among the others, is
+    /// rejected with its canonical form and not recorded again; every other
+    /// edge is accepted.
+    #[proptest]
+    fn rejects_a_repeated_edge(
+        #[strategy(1..=4usize)] nodes: usize,
+        /// Distinct edges, in the encoding of `validate`'s `build`: 0 is
+        /// `START` as a source and `END` as a target, and `k` is the node
+        /// `k - 1`.
+        #[strategy(
+            prop::collection::btree_set((0..=#nodes, 0..=#nodes), 1..8)
+                .prop_map(Vec::from_iter)
+                .prop_shuffle()
+        )]
+        edges: Vec<(usize, usize)>,
+        /// The edge added again.
+        #[strategy(0..#edges.len())]
+        repeated: usize,
+        /// Where the repeat is added, after the edge's first addition.
+        #[strategy(#repeated + 1..=#edges.len())]
+        at: usize,
+    ) {
+        let names: Vec<String> = (0..nodes).map(|i| format!("n{i}")).collect();
+        let (mut t, ids) = topology(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let sources: Vec<Source> = std::iter::once(Source::Start)
+            .chain(ids.iter().copied().map(Source::Node))
+            .collect();
+        let targets: Vec<Target> = std::iter::once(Target::End)
+            .chain(ids.iter().copied().map(Target::Node))
+            .collect();
+        let recorded: Vec<Edge> = edges
+            .iter()
+            .map(|&(from, to)| Edge {
+                from: from.checked_sub(1),
+                to: to.checked_sub(1),
+            })
+            .collect();
+        // The canonical form is pinned by `describes_edges_by_their_ends`.
+        let duplicate = BuildError::DuplicateEdge {
+            edge: recorded[repeated].describe(&t.names),
+        };
+        let mut calls = edges.clone();
+        calls.insert(at, edges[repeated]);
+        for (i, &(from, to)) in calls.iter().enumerate() {
+            let expected = if i == at {
+                Err(duplicate.clone())
+            } else {
+                Ok(())
+            };
+            prop_assert_eq!(t.add_edge(sources[from], targets[to]), expected);
+        }
+        prop_assert_eq!(
+            &t.declared,
+            &recorded.iter().copied().collect::<HashSet<_>>()
+        );
+        prop_assert_eq!(t.edges, recorded);
+    }
+
+    /// An edge reads `from → to`, with nodes by name and the boundaries as
+    /// `START` and `END`, whatever the names and whichever nodes it joins.
+    /// Every case checks all four shapes of edge.
+    #[proptest]
+    fn describes_edges_by_their_ends(
+        #[strategy(
+            prop::collection::hash_set(valid_name(MAX_NAME_LEN), 1..4).prop_map(Vec::from_iter)
+        )]
+        names: Vec<String>,
+        /// The source node, when the edge has one.
+        #[strategy(0..#names.len())]
+        from: usize,
+        /// The target node, when the edge has one.
+        #[strategy(0..#names.len())]
+        to: usize,
+    ) {
+        let (t, _) = topology(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let describe = |from, to| Edge { from, to }.describe(&t.names);
+        let (a, b) = (&names[from], &names[to]);
+        prop_assert_eq!(describe(None, Some(to)), format!("START → {b}"));
+        prop_assert_eq!(describe(Some(from), None), format!("{a} → END"));
+        prop_assert_eq!(describe(Some(from), Some(to)), format!("{a} → {b}"));
+        prop_assert_eq!(describe(None, None), "START → END");
     }
 
     // --- validate ------------------------------------------------------------
@@ -430,10 +544,10 @@ mod tests {
     #[proptest]
     fn reports_a_missing_start_edge(
         #[strategy(1..=6usize)] nodes: usize,
-        #[strategy(prop::collection::vec((1..=#nodes, 0..=#nodes), 0..10))] edges: Vec<(
-            usize,
-            usize,
-        )>,
+        #[strategy(
+            prop::collection::btree_set((1..=#nodes, 0..=#nodes), 0..10).prop_map(Vec::from_iter)
+        )]
+        edges: Vec<(usize, usize)>,
         #[strategy(prop::collection::vec(prop::sample::select(CHANNEL_NAMES), 0..6))] channels: Vec<
             &'static str,
         >,
@@ -444,68 +558,6 @@ mod tests {
                 .validate(specs(&channels))
                 .err(),
             Some(BuildError::NoStartEdge)
-        );
-    }
-
-    /// A graph with more than one edge from `START` reports
-    /// `MultipleStartEdges`, whatever its other edges and channels.
-    #[proptest]
-    fn reports_more_than_one_start_edge(
-        #[strategy(1..=6usize)] nodes: usize,
-        #[strategy(prop::collection::vec(0..=#nodes, 2..5))] starts: Vec<usize>,
-        #[strategy(prop::collection::vec((0..=#nodes, 0..=#nodes), 0..10))] others: Vec<(
-            usize,
-            usize,
-        )>,
-        #[strategy(prop::collection::vec(prop::sample::select(CHANNEL_NAMES), 0..6))] channels: Vec<
-            &'static str,
-        >,
-    ) {
-        let order: Vec<usize> = (0..nodes).collect();
-        let edges: Vec<(usize, usize)> = starts.iter().map(|&to| (0, to)).chain(others).collect();
-        prop_assert_eq!(
-            build(&names(&order), &edges)
-                .validate(specs(&channels))
-                .err(),
-            Some(BuildError::MultipleStartEdges)
-        );
-    }
-
-    /// With one edge from `START`, a graph whose chosen nodes have two
-    /// outgoing edges reports the first of them by name, whatever is
-    /// unreachable and whatever its channels. A node's second edge may repeat
-    /// its first, which still counts as two.
-    #[proptest]
-    fn reports_the_first_branching_node_by_name(
-        // Read only by the other inputs' strategies, which it sizes.
-        #[strategy(1..=6usize)] _nodes: usize,
-        #[strategy(Just((0..#_nodes).collect::<Vec<usize>>()).prop_shuffle())] order: Vec<usize>,
-        #[strategy(0..=#_nodes)] start: usize,
-        #[strategy(prop::sample::subsequence((0..#_nodes).collect::<Vec<usize>>(), 1..=#_nodes))]
-        branching: Vec<usize>,
-        #[strategy(prop::collection::vec((0..=#_nodes, 0..=#_nodes), #_nodes))] targets: Vec<(
-            usize,
-            usize,
-        )>,
-        #[strategy(prop::collection::vec(prop::sample::select(CHANNEL_NAMES), 0..6))] channels: Vec<
-            &'static str,
-        >,
-    ) {
-        // Every node gets one edge, and the branching nodes a second.
-        let edges: Vec<(usize, usize)> = std::iter::once((0, start))
-            .chain(
-                targets
-                    .iter()
-                    .enumerate()
-                    .map(|(node, &(first, _))| (node + 1, first)),
-            )
-            .chain(branching.iter().map(|&node| (node + 1, targets[node].1)))
-            .collect();
-        let names = names(&order);
-        let first = branching.iter().map(|&node| &names[node]).min().unwrap();
-        prop_assert_eq!(
-            build(&names, &edges).validate(specs(&channels)).err(),
-            Some(BuildError::MultipleOutgoing { node: name(first) })
         );
     }
 
@@ -546,10 +598,9 @@ mod tests {
     }
 
     /// When a graph fails several checks, the first in the documented order is
-    /// reported: no nodes, no edge from `START`, more than one edge from
-    /// `START`, a node with more than one outgoing edge, an unreachable node,
-    /// then the channels. Each case below also fails every check after the
-    /// one it expects.
+    /// reported: no nodes, no edge from `START`, an unreachable node, then the
+    /// channels. Each case below also fails every check after the one it
+    /// expects.
     #[test]
     fn reports_the_first_check_that_fails() {
         let bad = || specs(&[INVALID_NAME]);
@@ -559,25 +610,11 @@ mod tests {
             build(&[], &[]).validate(bad()).unwrap_err(),
             BuildError::Empty
         );
-        // n0 → END twice and n1 unreachable, but nothing leaves START.
+        // n0 → END and n1 → n0, so both are unreachable, but nothing leaves
+        // START.
         assert_eq!(
-            build(&two, &[(1, 0), (1, 0)]).validate(bad()).unwrap_err(),
+            build(&two, &[(1, 0), (2, 1)]).validate(bad()).unwrap_err(),
             BuildError::NoStartEdge
-        );
-        // START → n0 and START → END, n0 → END twice, n1 unreachable.
-        assert_eq!(
-            build(&two, &[(0, 1), (0, 0), (1, 0), (1, 0)])
-                .validate(bad())
-                .unwrap_err(),
-            BuildError::MultipleStartEdges
-        );
-        // START → n0, then n0 → END twice, the same edge repeated, which
-        // counts as two; n1 is unreachable.
-        assert_eq!(
-            build(&two, &[(0, 1), (1, 0), (1, 0)])
-                .validate(bad())
-                .unwrap_err(),
-            BuildError::MultipleOutgoing { node: name("n0") }
         );
         // START → n0 → END, with n1 never reached.
         assert_eq!(
@@ -590,6 +627,49 @@ mod tests {
                 .validate(bad())
                 .unwrap_err(),
             BuildError::InvalidChannelName(validate_name(INVALID_NAME).unwrap_err())
+        );
+    }
+
+    /// Any number of edges may leave `START` and each node: with every node
+    /// reached, the graph is valid, and the validated topology keeps each
+    /// node's targets, and `START`'s, in declaration order, without `END`.
+    #[proptest]
+    fn accepts_fan_out_from_start_and_nodes(
+        #[strategy(1..=6usize)] nodes: usize,
+        /// A chain through every node, so each is reached.
+        #[strategy(Just((0..#nodes).collect::<Vec<usize>>()).prop_shuffle())]
+        path: Vec<usize>,
+        /// More edges, in `build`'s encoding and in random order; those the
+        /// chain already has are dropped. Never empty, so the filter below
+        /// always runs.
+        #[strategy(
+            prop::collection::btree_set((0..=#nodes, 0..=#nodes), 1..12)
+                .prop_map(Vec::from_iter)
+                .prop_shuffle()
+        )]
+        extra: Vec<(usize, usize)>,
+    ) {
+        let chained = chain(&path);
+        let edges: Vec<(usize, usize)> = chained
+            .iter()
+            .copied()
+            .chain(extra.iter().copied().filter(|edge| !chained.contains(edge)))
+            .collect();
+        let order: Vec<usize> = (0..nodes).collect();
+        let valid = build(&names(&order), &edges)
+            .validate(specs(&["count"]))
+            .unwrap();
+        let targets = |source: usize| -> Vec<usize> {
+            edges
+                .iter()
+                .filter(|&&(from, to)| from == source && to != 0)
+                .map(|&(_, to)| to - 1)
+                .collect()
+        };
+        prop_assert_eq!(valid.start, targets(0));
+        prop_assert_eq!(
+            valid.successors,
+            (1..=nodes).map(targets).collect::<Vec<_>>()
         );
     }
 

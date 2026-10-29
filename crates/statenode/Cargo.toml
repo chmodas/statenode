@@ -8,12 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures-util = { workspace = true, features = ["alloc"] }
 tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
 proptest.workspace = true
 test-strategy.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 tower = { workspace = true, features = ["buffer", "limit", "retry", "timeout", "util"] }
 
 [lints]

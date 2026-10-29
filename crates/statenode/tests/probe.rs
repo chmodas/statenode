@@ -322,3 +322,70 @@ async fn a_cloned_config_shares_the_context_and_the_limit() {
     assert_eq!(first, second);
     assert_eq!(first.log[1], "shared");
 }
+
+/// A fan-out's branches merge in task-path order, not the order they
+/// complete or were declared in: `log_b` is declared first, and `log_a`
+/// yields before it finishes, yet `log_a`'s message comes first.
+#[tokio::test]
+async fn a_fan_out_logs_its_branches_in_task_path_order() {
+    let mut g = Builder::new();
+    let log_b = g
+        .add_node(
+            "log_b",
+            node::from_fn(|_s, _ctx| async move { Ok(Some(ProbeUpdate::Log("b".into()))) }),
+        )
+        .unwrap();
+    let log_a = g
+        .add_node(
+            "log_a",
+            node::from_fn(|_s, _ctx| async move {
+                tokio::task::yield_now().await;
+                Ok(Some(ProbeUpdate::Log("a".into())))
+            }),
+        )
+        .unwrap();
+    for branch in [log_b, log_a] {
+        g.add_edge(START, branch).unwrap();
+        g.add_edge(branch, END).unwrap();
+    }
+    let probe = g
+        .compile()
+        .unwrap()
+        .invoke(ProbeUpdate::Set(0), RunConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(probe.log, ["a", "b"]);
+}
+
+/// When one branch fails and a sibling's update would be rejected, the node
+/// error is reported: the step's updates are never applied.
+#[tokio::test]
+async fn a_node_error_wins_over_a_reduce_error_in_the_same_step() {
+    let mut g = Builder::new();
+    let reject = g
+        .add_node(
+            "a_reject",
+            node::from_fn(|_s, _ctx| async move { Ok(Some(ProbeUpdate::Reject)) }),
+        )
+        .unwrap();
+    let fail = g
+        .add_node(
+            "b_fail",
+            node::from_fn(|_s, _ctx| async move { Err::<(), _>(Failure.into()) }),
+        )
+        .unwrap();
+    for branch in [reject, fail] {
+        g.add_edge(START, branch).unwrap();
+        g.add_edge(branch, END).unwrap();
+    }
+    let error = g
+        .compile()
+        .unwrap()
+        .invoke(ProbeUpdate::Set(0), RunConfig::default())
+        .await
+        .unwrap_err();
+    let RunError::Node(error) = error else {
+        panic!("expected a node error, got {error:?}");
+    };
+    assert_eq!(error.node().as_str(), "b_fail");
+}
