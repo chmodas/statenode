@@ -11,6 +11,7 @@ repository = "https://github.com/chmodas/statenode"
 description = "A graph-based runtime and state machine engine for LLM agent workflows."
 
 [workspace.dependencies]
+futures-util = { version = "0.3", default-features = false }
 proptest = "1"
 test-strategy = "0.4"
 tokio = { version = "1", default-features = false }

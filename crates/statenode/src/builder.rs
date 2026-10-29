@@ -139,6 +139,10 @@ impl<S: State, C: Send + Sync + 'static> GraphBuilder<S, C> {
     ///   attempt count, for example, starts afresh for each task. To share
     ///   state across tasks, keep it behind an `Arc`, or use a stateful layer
     ///   that does, such as `ConcurrencyLimit` or `Buffer`.
+    /// - **Concurrent siblings.** The tasks of one superstep run concurrently,
+    ///   so state shared behind an `Arc`, a `ConcurrencyLimit` or a `Buffer`
+    ///   sees concurrent requests from one step. A shared limit below the
+    ///   number of sibling tasks runs some of them one after another.
     /// - **Services and layers that are not `Clone` or not `Sync`**, such as
     ///   `RateLimit`, `Hedge`, `Balance`, or a stack boxed with
     ///   `ServiceBuilder::boxed_clone`, must be wrapped in `Buffer`. `Buffer`
@@ -212,10 +216,15 @@ impl<S: State, C: Send + Sync + 'static> GraphBuilder<S, C> {
 
     /// Adds an edge: when `from` completes, `to` runs in the next superstep.
     ///
+    /// A node, or [`START`], may have any number of edges. Their targets run
+    /// concurrently in the next superstep, against the same state, and a node
+    /// that several edges lead to runs once.
+    ///
     /// # Errors
     ///
     /// Returns [`BuildError::ForeignNode`] if either end is a handle from a
-    /// different builder.
+    /// different builder, then [`BuildError::DuplicateEdge`] if the same edge
+    /// was already added. A rejected edge is not added.
     ///
     /// # Examples
     ///
@@ -239,6 +248,34 @@ impl<S: State, C: Send + Sync + 'static> GraphBuilder<S, C> {
     /// let graph = g.compile()?;
     /// # Ok::<(), statenode::BuildError>(())
     /// ```
+    ///
+    /// Two nodes that run concurrently, in the same superstep:
+    ///
+    /// ```
+    /// use statenode::{BuildError, END, GraphBuilder, START, node};
+    /// # use statenode::{ChannelSpec, ReduceError, State, TaskPath};
+    /// # #[derive(Clone, Default)]
+    /// # struct Empty;
+    /// # impl State for Empty {
+    /// #     type Update = ();
+    /// #     fn channels(&self) -> Result<Vec<ChannelSpec>, statenode::NameError> { Ok(Vec::new()) }
+    /// #     fn apply_step(&mut self, _: Vec<(TaskPath, ())>) -> Result<(), ReduceError> { Ok(()) }
+    /// # }
+    ///
+    /// let mut g = GraphBuilder::<Empty>::new();
+    /// let search = g.add_node("search", node::from_fn(|_s, _ctx| async move { Ok(()) }))?;
+    /// let lookup = g.add_node("lookup", node::from_fn(|_s, _ctx| async move { Ok(()) }))?;
+    /// g.add_edge(START, search)?;
+    /// g.add_edge(START, lookup)?;
+    /// g.add_edge(search, END)?;
+    /// g.add_edge(lookup, END)?;
+    /// assert_eq!(
+    ///     g.add_edge(START, search),
+    ///     Err(BuildError::DuplicateEdge { edge: "START → search".to_owned() })
+    /// );
+    /// let graph = g.compile()?;
+    /// # Ok::<(), BuildError>(())
+    /// ```
     pub fn add_edge(
         &mut self,
         from: impl Into<Source>,
@@ -253,8 +290,6 @@ impl<S: State, C: Send + Sync + 'static> GraphBuilder<S, C> {
     ///
     /// Returns the first structural problem found, checking in this order:
     /// [`Empty`](BuildError::Empty), [`NoStartEdge`](BuildError::NoStartEdge),
-    /// [`MultipleStartEdges`](BuildError::MultipleStartEdges),
-    /// [`MultipleOutgoing`](BuildError::MultipleOutgoing),
     /// [`Unreachable`](BuildError::Unreachable), then the state's channels:
     /// [`InvalidChannelName`](BuildError::InvalidChannelName) for the name
     /// error [`State::channels`] returned, if any, wherever that name falls
@@ -338,8 +373,9 @@ mod tests {
     }
 
     /// `add_edge` takes `START`, `END` and handles at the ends they are
-    /// allowed, records each edge in order and direction, and rejects a
-    /// handle from another builder at either end without recording it.
+    /// allowed and records each edge in order and direction. It rejects a
+    /// handle from another builder at either end, and an edge added twice,
+    /// without recording either.
     #[test]
     fn add_edge_records_edges_and_rejects_foreign_handles() {
         let mut g = GraphBuilder::<Counter>::new();
@@ -353,8 +389,19 @@ mod tests {
         assert_eq!(g.add_edge(foreign, a), Err(BuildError::ForeignNode));
         assert_eq!(g.add_edge(a, foreign), Err(BuildError::ForeignNode));
         assert_eq!(
+            g.add_edge(a, END),
+            Err(BuildError::DuplicateEdge {
+                edge: "a → END".to_owned()
+            })
+        );
+        let edge = |from, to| topology::Edge { from, to };
+        assert_eq!(
             g.topology.edges,
-            vec![(None, Some(0)), (Some(0), Some(0)), (Some(0), None)],
+            vec![
+                edge(None, Some(0)),
+                edge(Some(0), Some(0)),
+                edge(Some(0), None)
+            ],
             "edges are recorded in order, rejected ones are not"
         );
     }

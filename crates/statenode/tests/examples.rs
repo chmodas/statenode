@@ -196,3 +196,49 @@ async fn nodes_capture_values_by_cloning_into_an_async_block() {
         .unwrap();
     assert_eq!(out.title, "count: 3");
 }
+
+/// A fan-out: two branches run in the same superstep, each writing its own
+/// channel, and both updates are applied together.
+#[tokio::test]
+async fn two_branches_write_different_channels_in_one_step() {
+    let mut g = GraphBuilder::<Document>::new();
+    let title = g
+        .add_node(
+            "title",
+            node::from_fn(|_s, _ctx| async move {
+                Ok(Some(DocumentUpdate {
+                    title: Some("Report".to_owned()),
+                    revisions: None,
+                }))
+            }),
+        )
+        .unwrap();
+    let revise = g
+        .add_node(
+            "revise",
+            node::from_fn(|s: Arc<Document>, _ctx| async move {
+                Ok(Some(DocumentUpdate {
+                    title: None,
+                    revisions: Some(s.revisions + 1),
+                }))
+            }),
+        )
+        .unwrap();
+    g.add_edge(START, title).unwrap();
+    g.add_edge(START, revise).unwrap();
+    g.add_edge(title, END).unwrap();
+    g.add_edge(revise, END).unwrap();
+    let graph = g.compile().unwrap();
+
+    let document = graph
+        .invoke(DocumentUpdate::default(), RunConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        document,
+        Document {
+            title: "Report".to_owned(),
+            revisions: 1,
+        }
+    );
+}
