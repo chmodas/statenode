@@ -1,5 +1,7 @@
 //! Happy-path examples of the public API, written to be read.
 
+use std::collections::BTreeSet;
+use std::mem;
 use std::sync::Arc;
 
 use statenode::{
@@ -239,6 +241,131 @@ async fn two_branches_write_different_channels_in_one_step() {
         Document {
             title: "Report".to_owned(),
             revisions: 1,
+        }
+    );
+}
+
+/// A research state that parallel branches write, through the three merging
+/// reducers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Research {
+    /// What the branches found, appended in task-path order.
+    findings: Vec<String>,
+    /// What the branches cost, summed.
+    cost: u64,
+    /// The research's tags, changed by tag operations.
+    tags: BTreeSet<String>,
+}
+
+/// An operation on [`Research::tags`].
+#[derive(Debug, Clone, Copy)]
+enum Tag {
+    /// Adds a tag.
+    Add(&'static str),
+    /// Removes a tag, which must be present.
+    Remove(&'static str),
+}
+
+/// An update to [`Research`]; empty fields leave their channel unwritten.
+#[derive(Debug, Default)]
+struct ResearchUpdate {
+    /// Findings to append.
+    findings: Vec<String>,
+    /// A cost to add.
+    cost: Option<u64>,
+    /// Tag operations to apply.
+    tags: Vec<Tag>,
+}
+
+/// Applies one tag operation; removing a missing tag is an error.
+fn apply_tag(tags: &mut BTreeSet<String>, op: Tag) -> Result<(), BoxError> {
+    match op {
+        Tag::Add(tag) => {
+            tags.insert(tag.to_owned());
+            Ok(())
+        }
+        Tag::Remove(tag) if tags.remove(tag) => Ok(()),
+        Tag::Remove(tag) => Err(format!("no tag `{tag}` to remove").into()),
+    }
+}
+
+impl State for Research {
+    type Update = ResearchUpdate;
+
+    fn channels(&self) -> Result<Vec<ChannelSpec>, NameError> {
+        Ok(vec![
+            ChannelSpec::new("findings")?,
+            ChannelSpec::new("cost")?,
+            ChannelSpec::new("tags")?,
+        ])
+    }
+
+    fn apply_step(
+        &mut self,
+        mut updates: Vec<(TaskPath, ResearchUpdate)>,
+    ) -> Result<(), ReduceError> {
+        let findings = updates
+            .iter_mut()
+            .map(|(p, u)| (&*p, mem::take(&mut u.findings)));
+        reducer::append(&mut self.findings, findings);
+
+        let costs = updates.iter().filter_map(|(p, u)| u.cost.map(|c| (p, c)));
+        reducer::combine(&mut self.cost, costs, |total, c| *total += c);
+
+        let tags = updates.iter_mut().flat_map(|(p, u)| {
+            let p: &TaskPath = p;
+            mem::take(&mut u.tags).into_iter().map(move |op| (p, op))
+        });
+        reducer::fold("tags", &mut self.tags, tags, apply_tag)
+    }
+}
+
+/// Two branches write the same three channels in one step, and the reducers
+/// merge their writes in task-path order instead of conflicting: `alpha`'s
+/// before `beta`'s, so `beta` can remove the tag `alpha` added.
+#[tokio::test]
+async fn a_fan_out_merges_its_branches_with_reducers() {
+    let mut g = GraphBuilder::<Research>::new();
+    let beta = g
+        .add_node(
+            "beta",
+            node::from_fn(|_s, _ctx| async move {
+                Ok(Some(ResearchUpdate {
+                    findings: vec!["beta found B".to_owned()],
+                    cost: Some(5),
+                    tags: vec![Tag::Remove("unreviewed"), Tag::Add("reviewed")],
+                }))
+            }),
+        )
+        .unwrap();
+    let alpha = g
+        .add_node(
+            "alpha",
+            node::from_fn(|_s, _ctx| async move {
+                Ok(Some(ResearchUpdate {
+                    findings: vec!["alpha found A".to_owned()],
+                    cost: Some(3),
+                    tags: vec![Tag::Add("unreviewed")],
+                }))
+            }),
+        )
+        .unwrap();
+    for branch in [beta, alpha] {
+        g.add_edge(START, branch).unwrap();
+        g.add_edge(branch, END).unwrap();
+    }
+    let graph = g.compile().unwrap();
+
+    let research = graph
+        .invoke(ResearchUpdate::default(), RunConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        research,
+        Research {
+            findings: vec!["alpha found A".to_owned(), "beta found B".to_owned()],
+            cost: 8,
+            tags: BTreeSet::from(["reviewed".to_owned()]),
         }
     );
 }

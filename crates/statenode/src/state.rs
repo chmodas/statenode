@@ -78,9 +78,10 @@ pub trait State: Clone + Send + Sync + 'static {
     ///
     /// Returns a [`ReduceError`] if an update breaks one of the state's
     /// invariants, such as a second write in one step to a channel applied
-    /// with [`reducer::replace`](crate::reducer::replace). The run then fails
-    /// with [`RunError::Reduce`](crate::RunError::Reduce), and the partially
-    /// updated state is discarded.
+    /// with [`reducer::replace`](crate::reducer::replace), or an operation
+    /// that [`reducer::fold`](crate::reducer::fold)'s operator rejects. The
+    /// run then fails with [`RunError::Reduce`](crate::RunError::Reduce), and
+    /// the partially updated state is discarded.
     fn apply_step(&mut self, updates: Vec<(TaskPath, Self::Update)>) -> Result<(), ReduceError>;
 }
 
