@@ -122,6 +122,7 @@ async fn a_fan_out_costs_one_step_of_the_limit() {
         len: 3,
         start: vec![Some(0), Some(1), Some(2)],
         successors: vec![vec![None]; 3],
+        joins: Vec::new(),
         yields: vec![0; 3],
     };
     let (result, visits) = spec.run(1).await.unwrap();
@@ -238,6 +239,7 @@ async fn wide_fan_outs_merge_in_task_path_order() {
             len,
             start: (0..len).map(Some).collect(),
             successors: vec![vec![None]; len],
+            joins: Vec::new(),
             yields: (0..len).rev().collect(),
         };
         let (result, _) = spec.run(1).await.unwrap();

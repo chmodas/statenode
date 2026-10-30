@@ -1,10 +1,15 @@
-//! The Pregel scheduler: a validated topology lowered to trigger channels,
-//! and the scheduling state of one run, channel versions and what each node
-//! has seen.
+//! The Pregel scheduler: a validated topology lowered to channels, and the
+//! scheduling state of one run: channel versions, what each channel's node
+//! has seen, and which sources each join has heard from.
 //!
-//! A node is planned when its trigger channel's version is newer than the
-//! version it saw when it last ran. The barrier gives every channel the step
-//! that wrote one new version and records what each node that ran has seen.
+//! Every node has a trigger channel, `branch:to:<node>`, and every join a
+//! barrier channel, `join:<sources>:<target>`. Each channel triggers exactly
+//! one node. A node is planned when one of its channels is *available* and
+//! has a newer version than the node saw when it last ran: a trigger channel
+//! is always available, a barrier only once every source has arrived. The
+//! barrier at the end of a step consumes the barriers that fired, records the
+//! step's writes and arrivals, gives every channel that changed one new
+//! version, and records what each node that ran has seen.
 //!
 //! This is the only module tied to the scheduling algorithm. Non-generic, so
 //! every state type shares one implementation of the scheduling rules.
@@ -15,9 +20,9 @@ use crate::name::NodeName;
 /// The version of a channel.
 ///
 /// Versions only grow. At each barrier one next version is computed from the
-/// largest current version and given to every channel written in that step,
-/// so a version depends only on the channel map, never on a counter that
-/// restarts with each run.
+/// largest current version and given to every channel that changed in that
+/// step, written, arrived at or consumed, so a version depends only on the
+/// channel map, never on a counter that restarts with each run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct ChannelVersion(u64);
 
@@ -33,9 +38,12 @@ impl ChannelVersion {
 
 /// A validated topology, lowered for the scheduler.
 ///
-/// Each node has one trigger channel, `branch:to:<node>`, with the same index
-/// as the node. An edge `a → b` means "when `a` completes, write `b`'s trigger
-/// channel"; an edge to `END` writes nothing.
+/// Channels `0..n` are the nodes' trigger channels, with the same index as
+/// their node; channels from `n` on are the joins' barriers, in declaration
+/// order. An edge `a → b` means "when `a` completes, write `b`'s trigger
+/// channel" (an edge to `END` writes nothing); a join `[a, b] → c` means
+/// "when `a` or `b` completes, it arrives at the join's barrier", which
+/// triggers `c` once both have.
 #[derive(Debug)]
 pub(crate) struct Wiring {
     /// Node names, by node index.
@@ -46,23 +54,58 @@ pub(crate) struct Wiring {
     pub(crate) successors: Vec<Vec<usize>>,
     /// The trigger channels the input writes.
     pub(crate) start_targets: Vec<usize>,
+    /// The node each channel triggers, by channel.
+    pub(crate) subscriber: Vec<usize>,
+    /// The channels that trigger each node by node: its trigger channel,
+    /// then the barriers of the joins into it.
+    pub(crate) triggers: Vec<Vec<usize>>,
+    /// Where each node arrives when it completes, by node: a barrier channel
+    /// and the node's position among that join's sources.
+    pub(crate) arrivals: Vec<Vec<(usize, usize)>>,
+    /// How many sources each channel waits for, by channel: none for a
+    /// trigger channel, every source of the join for a barrier.
+    pub(crate) required: Vec<usize>,
 }
 
 impl Wiring {
     /// Lowers `topology`: each node's successors become the trigger channels
-    /// it writes, and nodes are ranked by name for task-path order.
+    /// it writes, each joins a barrier channel, and nodes are ranked by name
+    /// for task-path order.
     pub(crate) fn new(topology: ValidTopology) -> Self {
+        let len = topology.names.len();
         let mut by_name: Vec<(&NodeName, usize)> = topology.names.iter().zip(0..).collect();
         by_name.sort_unstable();
-        let mut rank = vec![0; topology.names.len()];
+        let mut rank = vec![0; len];
         for (position, &(_, node)) in by_name.iter().enumerate() {
             rank.get_mut(node).into_iter().for_each(|r| *r = position);
+        }
+        let mut subscriber: Vec<usize> = (0..len).collect();
+        let mut triggers: Vec<Vec<usize>> = (0..len).map(|node| vec![node]).collect();
+        let mut arrivals: Vec<Vec<(usize, usize)>> = vec![Vec::new(); len];
+        let mut required = vec![0; len];
+        for (barrier, join) in (len..).zip(&topology.joins) {
+            subscriber.push(join.target);
+            required.push(join.sources.len());
+            triggers
+                .get_mut(join.target)
+                .into_iter()
+                .for_each(|of| of.push(barrier));
+            for (position, &source) in join.sources.iter().enumerate() {
+                arrivals
+                    .get_mut(source)
+                    .into_iter()
+                    .for_each(|of| of.push((barrier, position)));
+            }
         }
         Self {
             rank,
             successors: topology.successors,
             start_targets: topology.start,
             names: topology.names,
+            subscriber,
+            triggers,
+            arrivals,
+            required,
         }
     }
 }
@@ -71,55 +114,87 @@ impl Wiring {
 ///
 /// Planning reads it and never changes it; only [`Scheduler::barrier`],
 /// called after a step's updates have been applied successfully, changes it.
-/// A failing step therefore leaves versions and `versions_seen` exactly as
-/// they were at its start.
+/// A failing step therefore leaves the scheduling state exactly as it was at
+/// its start.
 #[derive(Debug)]
 pub(crate) struct Scheduler<'w> {
-    /// The graph's lowered edges.
+    /// The graph's lowered edges and joins.
     wiring: &'w Wiring,
-    /// The version of each trigger channel, by node index.
+    /// The version of each channel, by channel.
     versions: Vec<ChannelVersion>,
-    /// The version of its trigger channel each node last ran against.
+    /// The version of each channel its node last ran against, by channel:
+    /// each channel triggers one node, so one entry per channel suffices.
     versions_seen: Vec<ChannelVersion>,
     /// The largest version of any channel.
     max_version: ChannelVersion,
-    /// The trigger channels written at the last barrier: the only candidates
-    /// for the next step, which keeps planning proportional to the writes.
+    /// The channels written, or barriers completed, at the last barrier: the
+    /// only candidates for the next step, which keeps planning proportional
+    /// to the writes.
     updated: Vec<usize>,
+    /// Which sources have arrived at each barrier since it last fired, by
+    /// channel and source position; empty for trigger channels.
+    arrived: Vec<Vec<bool>>,
+    /// How many sources have arrived at each barrier, by channel.
+    count: Vec<usize>,
 }
 
 impl<'w> Scheduler<'w> {
-    /// The scheduling state before the input is applied: every version is 0.
+    /// The scheduling state before the input is applied: every version is 0,
+    /// and no source has arrived anywhere.
     pub(crate) fn new(wiring: &'w Wiring) -> Self {
-        let len = wiring.names.len();
+        let channels = wiring.required.len();
         Self {
             wiring,
-            versions: vec![ChannelVersion::default(); len],
-            versions_seen: vec![ChannelVersion::default(); len],
+            versions: vec![ChannelVersion::default(); channels],
+            versions_seen: vec![ChannelVersion::default(); channels],
             max_version: ChannelVersion::default(),
             updated: Vec::new(),
+            arrived: wiring.required.iter().map(|&n| vec![false; n]).collect(),
+            count: vec![0; channels],
         }
     }
 
-    /// The nodes to run in the next step, sorted by task path.
+    /// Whether `channel` can trigger its node: a trigger channel always can,
+    /// a barrier once every source has arrived.
+    fn available(&self, channel: usize) -> bool {
+        self.count.get(channel) == self.wiring.required.get(channel)
+    }
+
+    /// Whether `channel` is a barrier every source has arrived at.
+    fn complete(&self, channel: usize) -> bool {
+        self.wiring.required.get(channel).is_some_and(|&n| n > 0) && self.available(channel)
+    }
+
+    /// The nodes to run in the next step, sorted by task path, each once.
     ///
-    /// A node runs if its trigger channel has a newer version than the one it
-    /// last ran against.
+    /// A node runs if one of its channels is available and has a newer
+    /// version than the one it last ran against.
     ///
-    /// With only edge triggers, every candidate was just written and so always
-    /// passes the comparison. It stays because it *is* the scheduling rule:
-    /// it starts to reject candidates when a node has several triggers, and
-    /// when a run resumes from stored versions.
+    /// The candidates are the nodes that the channels updated at the last
+    /// barrier trigger. A candidate planned from the last barrier's state
+    /// always passes the comparison: its channel was written, or its barrier
+    /// completed, after the node last ran. The comparison still decides, so
+    /// planning stays correct from versions that did not come from the last
+    /// barrier, such as stored ones.
     pub(crate) fn plan(&self) -> Vec<usize> {
         let mut tasks: Vec<usize> = self
             .updated
             .iter()
-            .copied()
-            .filter(|&node| self.versions.get(node) > self.versions_seen.get(node))
+            .filter_map(|&channel| self.wiring.subscriber.get(channel).copied())
             .collect();
-        // `updated` holds each channel once (the barrier deduplicates it), and
-        // each channel triggers one node, so the tasks are already unique.
-        tasks.sort_unstable_by_key(|&node| self.wiring.rank.get(node).copied());
+        tasks.sort_unstable_by_key(|&node| (self.wiring.rank.get(node).copied(), node));
+        tasks.dedup();
+        tasks.retain(|&node| {
+            self.wiring
+                .triggers
+                .get(node)
+                .into_iter()
+                .flatten()
+                .any(|&channel| {
+                    self.available(channel)
+                        && self.versions.get(channel) > self.versions_seen.get(channel)
+                })
+        });
         tasks
     }
 
@@ -133,22 +208,65 @@ impl<'w> Scheduler<'w> {
             .collect()
     }
 
-    /// Commits a step: `ran` saw the versions they were planned against, and
-    /// `written` get the step's version.
-    pub(crate) fn barrier(&mut self, ran: &[usize], mut written: Vec<usize>) {
+    /// Commits a step: first `ran` saw the versions they were planned
+    /// against, and the barriers that fired for them are consumed; then
+    /// `written` and the arrivals of `ran` are recorded, so a source that ran
+    /// as its join fired counts towards the join's next round. Every channel
+    /// that changed gets the step's version; the written channels and the
+    /// barriers that completed are the next step's candidates.
+    pub(crate) fn barrier(&mut self, ran: &[usize], written: Vec<usize>) {
+        let wiring = self.wiring;
+        let mut changed = Vec::new();
         for &node in ran {
-            let version = self.versions.get(node).copied();
-            self.versions_seen
-                .get_mut(node)
-                .into_iter()
-                .zip(version)
-                .for_each(|(seen, version)| *seen = version);
+            for &channel in wiring.triggers.get(node).into_iter().flatten() {
+                let version = self.versions.get(channel).copied();
+                self.versions_seen
+                    .get_mut(channel)
+                    .into_iter()
+                    .zip(version)
+                    .for_each(|(seen, version)| *seen = version);
+                if self.complete(channel) {
+                    self.arrived
+                        .get_mut(channel)
+                        .into_iter()
+                        .flatten()
+                        .for_each(|arrived| *arrived = false);
+                    self.count
+                        .get_mut(channel)
+                        .into_iter()
+                        .for_each(|count| *count = 0);
+                    changed.push(channel);
+                }
+            }
         }
-        written.sort_unstable();
-        written.dedup();
-        if !written.is_empty() {
+        let mut updated = written;
+        changed.extend(&updated);
+        for &node in ran {
+            for &(channel, position) in wiring.arrivals.get(node).into_iter().flatten() {
+                let new = self
+                    .arrived
+                    .get_mut(channel)
+                    .and_then(|arrived| arrived.get_mut(position))
+                    .is_some_and(|arrived| !std::mem::replace(arrived, true));
+                if new {
+                    self.count
+                        .get_mut(channel)
+                        .into_iter()
+                        .for_each(|count| *count += 1);
+                    changed.push(channel);
+                    if self.complete(channel) {
+                        updated.push(channel);
+                    }
+                }
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        updated.sort_unstable();
+        updated.dedup();
+        if !changed.is_empty() {
             let next = self.max_version.next();
-            for &channel in &written {
+            for &channel in &changed {
                 self.versions
                     .get_mut(channel)
                     .into_iter()
@@ -156,7 +274,7 @@ impl<'w> Scheduler<'w> {
             }
             self.max_version = next;
         }
-        self.updated = written;
+        self.updated = updated;
     }
 }
 
@@ -167,10 +285,11 @@ mod tests {
     use proptest::prelude::*;
     use test_strategy::{Arbitrary, proptest};
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::iter::once;
 
     use super::*;
+    use crate::builder::Join;
     use crate::testing::valid_name;
 
     // --- ChannelVersion ------------------------------------------------------
@@ -200,7 +319,7 @@ mod tests {
     struct Parts {
         /// The node names, by node index, shuffled by proptest's own RNG so a
         /// recorded failure replays in the same declaration order.
-        #[strategy(prop::collection::btree_set(valid_name(8), 1..8).prop_map(Vec::from_iter).prop_shuffle())]
+        #[strategy(prop::collection::btree_set(valid_name(8), 2..8).prop_map(Vec::from_iter).prop_shuffle())]
         names: Vec<String>,
         /// The nodes `START` leads to.
         #[strategy(prop::collection::vec(0..#names.len(), 1..3))]
@@ -208,6 +327,19 @@ mod tests {
         /// The nodes each node leads to.
         #[strategy(prop::collection::vec(prop::collection::vec(0..#names.len(), 0..3), #names.len()))]
         successors: Vec<Vec<usize>>,
+        /// The joins: at least one, so the join tests' loops run on every
+        /// case, each with distinct sources and a target.
+        #[strategy(prop::collection::vec(
+            (
+                prop::sample::subsequence(
+                    (0..#names.len()).collect::<Vec<usize>>(),
+                    2..=#names.len().min(3)
+                ),
+                0..#names.len(),
+            ),
+            1..3
+        ))]
+        joins: Vec<(Vec<usize>, usize)>,
     }
 
     impl Parts {
@@ -225,6 +357,14 @@ mod tests {
                 names: self.names(),
                 start: self.start.clone(),
                 successors: self.successors.clone(),
+                joins: self
+                    .joins
+                    .iter()
+                    .map(|(sources, target)| Join {
+                        sources: sources.clone(),
+                        target: *target,
+                    })
+                    .collect(),
             }
         }
     }
@@ -251,40 +391,115 @@ mod tests {
         );
     }
 
-    // --- Scheduler -----------------------------------------------------------
-
-    /// Wiring for `len` nodes named `n0`, `n1`, …, with the given successors and
-    /// start targets. Names are zero-padded so name order is index order.
-    fn wiring(successors: Vec<Vec<usize>>, start_targets: Vec<usize>) -> Wiring {
-        let len = successors.len();
-        Wiring {
-            names: (0..len)
-                .map(|i| NodeName::new(&format!("n{i:03}")).unwrap())
-                .collect(),
-            rank: (0..len).collect(),
-            successors,
-            start_targets,
+    /// Each node's trigger channel shares its index and triggers it alone;
+    /// each join's barrier channel, after them in declaration order,
+    /// triggers the join's target, waits for every source, and is where each
+    /// source arrives, at its position in the join.
+    #[proptest]
+    fn lowering_wires_each_join(parts: Parts) {
+        let w = Wiring::new(parts.topology());
+        let len = parts.names.len();
+        let barriers = (len..).zip(&parts.joins);
+        let mut triggers: Vec<Vec<usize>> = (0..len).map(|node| vec![node]).collect();
+        let mut arrivals: Vec<Vec<(usize, usize)>> = vec![Vec::new(); len];
+        for (barrier, (sources, target)) in barriers.clone() {
+            triggers[*target].push(barrier);
+            for (position, &source) in sources.iter().enumerate() {
+                arrivals[source].push((barrier, position));
+            }
         }
+        let subscriber: Vec<usize> = (0..len)
+            .chain(parts.joins.iter().map(|(_, target)| *target))
+            .collect();
+        let required: Vec<usize> = std::iter::repeat_n(0, len)
+            .chain(parts.joins.iter().map(|(sources, _)| sources.len()))
+            .collect();
+        prop_assert_eq!(
+            (w.subscriber, w.required, w.triggers, w.arrivals),
+            (subscriber, required, triggers, arrivals)
+        );
     }
 
-    /// The planning rule applied to every node, ignoring the candidate index.
+    // --- Scheduler -----------------------------------------------------------
+
+    /// Wiring lowered from one node per entry of `successors`, named `n000`,
+    /// `n001`, …, so name order is index order, with the given start targets
+    /// and joins, each its sources and target.
+    fn join_wiring(
+        successors: Vec<Vec<usize>>,
+        start_targets: Vec<usize>,
+        joins: Vec<(Vec<usize>, usize)>,
+    ) -> Wiring {
+        Wiring::new(ValidTopology {
+            names: (0..successors.len())
+                .map(|i| NodeName::new(&format!("n{i:03}")).unwrap())
+                .collect(),
+            start: start_targets,
+            successors,
+            joins: joins
+                .into_iter()
+                .map(|(sources, target)| Join { sources, target })
+                .collect(),
+        })
+    }
+
+    /// Wiring without joins: see [`join_wiring`].
+    fn wiring(successors: Vec<Vec<usize>>, start_targets: Vec<usize>) -> Wiring {
+        join_wiring(successors, start_targets, Vec::new())
+    }
+
+    /// The wiring of one join of the nodes `0..sources` into node `sources`,
+    /// without edges.
+    fn one_join(sources: usize) -> Wiring {
+        join_wiring(
+            vec![Vec::new(); sources + 1],
+            Vec::new(),
+            vec![((0..sources).collect(), sources)],
+        )
+    }
+
+    /// `nodes` grouped into steps, `nodes[i]` running in step `steps[i]`:
+    /// the steps that run a node, in ascending order, each listing its nodes
+    /// in input order. `steps` has one entry per node.
+    fn in_steps(nodes: &[usize], steps: &[usize]) -> Vec<Vec<usize>> {
+        let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
+        for (&node, &step) in nodes.iter().zip(steps) {
+            grouped.entry(step).or_default().push(node);
+        }
+        grouped.into_values().collect()
+    }
+
+    /// The nodes in `0..sources`, a join's sources in these tests, that are
+    /// not in `nodes`, in index order.
+    fn others(sources: usize, nodes: &[usize]) -> Vec<usize> {
+        (0..sources).filter(|i| !nodes.contains(i)).collect()
+    }
+
+    /// The planning rule applied to every node, ignoring the candidates: the
+    /// nodes, in index order, with an available channel newer than they saw.
     fn plan_by_full_scan(s: &Scheduler<'_>) -> Vec<usize> {
-        (0..s.versions.len())
-            .filter(|&n| s.versions[n] > s.versions_seen[n])
+        (0..s.wiring.names.len())
+            .filter(|&n| {
+                s.wiring.triggers[n]
+                    .iter()
+                    .any(|&ch| s.available(ch) && s.versions[ch] > s.versions_seen[ch])
+            })
             .collect()
     }
 
-    /// A random graph: `START` leads to up to three random nodes, and each
-    /// node to up to two, as fan-out allows.
+    /// A random graph: `START` leads to up to three random nodes, each node
+    /// to up to two, and up to two joins of two or three nodes each lead to
+    /// another.
     ///
-    /// Its wiring appends a fixed gadget of two nodes, `START → x → y → END`,
-    /// so the first step always writes one channel (`y`) and leaves another
-    /// (`x`) unwritten, whatever was drawn: the properties' test code takes
-    /// both arms of "was this channel written?" on every run.
+    /// Its wiring appends a fixed gadget of four nodes, `START → a`,
+    /// `START → x → b` and the join `[a, b] → c`, so whatever was drawn the
+    /// first four steps leave a barrier partial, plan with it unavailable and
+    /// complete it, consume it, and leave it alone: the properties' test code
+    /// takes every arm on every run.
     #[derive(Debug, Arbitrary)]
     struct Graph {
         /// The number of random nodes.
-        #[strategy(1usize..40)]
+        #[strategy(2usize..40)]
         len: usize,
         /// For each node, the indices (modulo `len`) of its successors; `None`
         /// is `END`.
@@ -296,18 +511,27 @@ mod tests {
         /// The indices (modulo `len`) of the start targets.
         #[strategy(prop::collection::btree_set(0usize..1000, 1..=3))]
         start: BTreeSet<usize>,
-        /// How many steps to simulate: at least one, so the step loop always
-        /// runs.
-        #[strategy(1usize..60)]
+        /// The joins, each with distinct sources, by node index.
+        #[strategy(prop::collection::vec(
+            (
+                prop::sample::subsequence((0..#len).collect::<Vec<usize>>(), 2..=#len.min(3)),
+                0..#len,
+            ),
+            0..=2
+        ))]
+        joins: Vec<(Vec<usize>, usize)>,
+        /// How many steps to simulate: at least four, so the gadget's barrier
+        /// goes through every phase.
+        #[strategy(4usize..60)]
         steps: usize,
     }
 
     impl Graph {
-        /// The graph's wiring, with the gadget's `x` and `y` after the random
-        /// nodes. Each node's triggers are distinct, as a validated topology's
-        /// are.
+        /// The graph's wiring, with the gadget's `a`, `x`, `b` and `c` after
+        /// the random nodes. Each node's triggers are distinct, as a validated
+        /// topology's are.
         fn wiring(&self) -> Wiring {
-            let (x, y) = (self.len, self.len + 1);
+            let (a, x, b, c) = (self.len, self.len + 1, self.len + 2, self.len + 3);
             // One closure for both uses, so the start targets, which are never
             // empty, cover it.
             let wrap = |t: usize| t % self.len;
@@ -316,13 +540,19 @@ mod tests {
                 .successors
                 .iter()
                 .map(|targets| distinct(targets.iter().flatten().copied().map(wrap).collect()))
-                .chain([vec![y], Vec::new()])
+                .chain([Vec::new(), vec![b], Vec::new(), Vec::new()])
                 .collect();
             let start = distinct(self.start.iter().copied().map(wrap).collect())
                 .into_iter()
-                .chain(once(x))
+                .chain([a, x])
                 .collect();
-            wiring(successors, start)
+            let joins = self
+                .joins
+                .iter()
+                .cloned()
+                .chain(once((vec![a, b], c)))
+                .collect();
+            join_wiring(successors, start, joins)
         }
     }
 
@@ -425,34 +655,46 @@ mod tests {
     fn planning_changes_nothing(graph: Graph) {
         let w = graph.wiring();
         let s = after(&w, graph.steps);
-        let before = (s.versions.clone(), s.versions_seen.clone(), s.max_version);
+        let snapshot = |s: &Scheduler<'_>| {
+            (
+                s.versions.clone(),
+                s.versions_seen.clone(),
+                s.max_version,
+                s.updated.clone(),
+                s.arrived.clone(),
+                s.count.clone(),
+            )
+        };
+        let before = snapshot(&s);
         prop_assert_eq!(s.plan(), s.plan());
-        prop_assert_eq!((s.versions, s.versions_seen, s.max_version), before);
+        prop_assert_eq!(snapshot(&s), before);
     }
 
-    /// A barrier that writes nothing leaves every version, and the largest
-    /// one, as they were, at any point of any run.
+    /// A barrier with nothing run and nothing written leaves every version,
+    /// and the largest one, as they were, at any point of any run, and plans
+    /// nothing.
     #[proptest]
     fn a_barrier_without_writes_keeps_every_version(graph: Graph) {
         let w = graph.wiring();
         let mut s = after(&w, graph.steps);
         let before = (s.versions.clone(), s.max_version);
-        let tasks = s.plan();
-        s.barrier(&tasks, Vec::new());
-        prop_assert_eq!((s.versions, s.max_version), before);
+        s.barrier(&[], Vec::new());
+        prop_assert_eq!((s.versions.clone(), s.max_version), before);
+        prop_assert!(s.plan().is_empty());
     }
 
-    /// A barrier that writes nothing still marks the nodes that ran as
-    /// having seen their channels' current versions, at any point of any
-    /// run. Every node is marked, because the run may have ended and planned
-    /// none.
+    /// A barrier marks the nodes that ran as having seen the version each of
+    /// their channels had before it, at any point of any run, even when it
+    /// writes nothing. Every node is marked, because the run may have ended
+    /// and planned none.
     #[proptest]
     fn a_barrier_without_writes_marks_what_ran_as_seen(graph: Graph) {
         let w = graph.wiring();
         let mut s = after(&w, graph.steps);
+        let before = s.versions.clone();
         let ran: Vec<usize> = (0..w.names.len()).collect();
         s.barrier(&ran, Vec::new());
-        prop_assert_eq!(s.versions_seen, s.versions);
+        prop_assert_eq!(s.versions_seen, before);
     }
 
     /// A chain of any length, through the nodes in any order, runs one node
@@ -493,9 +735,15 @@ mod tests {
     }
 
     /// The indexed planner selects exactly what a full scan selects, at every
-    /// step, and versions behave as specified.
+    /// step, and versions change as specified: a channel changes exactly when
+    /// it is written, a source arrives at it anew, or it is a complete barrier
+    /// whose node ran; every channel that changes gets the step's one new
+    /// version; and each task's channels are marked seen at their versions
+    /// before the barrier.
     #[proptest(cases = 512)]
-    fn planning_matches_a_full_scan_and_versions_grow_only_on_writes(graph: Graph) {
+    fn planning_matches_a_full_scan_and_versions_change_only_on_writes_arrivals_and_consumes(
+        graph: Graph,
+    ) {
         let w = graph.wiring();
         let mut s = started(&w);
         for _ in 0..graph.steps {
@@ -504,24 +752,225 @@ mod tests {
             let before = s.versions.clone();
             let max_before = s.max_version;
             let written = s.written_by(&tasks);
-            s.barrier(&tasks, written.clone());
+            let consumed = tasks
+                .iter()
+                .flat_map(|&n| w.triggers[n].iter().copied())
+                .filter(|&ch| s.complete(ch));
+            let arrived = tasks
+                .iter()
+                .flat_map(|&n| w.arrivals[n].iter().copied())
+                .filter(|&(ch, position)| !s.arrived[ch][position])
+                .map(|(ch, _)| ch);
+            let changes: BTreeSet<usize> = written
+                .iter()
+                .copied()
+                .chain(consumed)
+                .chain(arrived)
+                .collect();
+            s.barrier(&tasks, written);
             for (channel, (old, new)) in before.iter().zip(&s.versions).enumerate() {
-                if written.contains(&channel) {
-                    // Written channels share the step's version, one above the old maximum.
+                if changes.contains(&channel) {
                     prop_assert_eq!(*new, max_before.next());
-                    prop_assert!(new > old);
                 } else {
                     prop_assert_eq!(new, old);
                 }
             }
             prop_assert_eq!(s.max_version, *s.versions.iter().max().unwrap());
             for &n in &tasks {
-                prop_assert_eq!(
-                    s.versions_seen[n],
-                    before[n],
-                    "a task sees the version it was planned for"
-                );
+                for &ch in &w.triggers[n] {
+                    prop_assert_eq!(
+                        s.versions_seen[ch],
+                        before[ch],
+                        "a task sees the versions it was planned against"
+                    );
+                }
             }
         }
+    }
+
+    /// A join's target is planned exactly once its last source has arrived,
+    /// whatever order the sources arrive in, one per step.
+    #[proptest]
+    fn a_barrier_fires_when_its_last_source_arrives(
+        #[strategy(2..=5usize)] sources: usize,
+        /// The order the sources arrive in.
+        #[strategy(Just((0..#sources).collect::<Vec<usize>>()).prop_shuffle())]
+        order: Vec<usize>,
+    ) {
+        let w = one_join(sources);
+        let mut s = Scheduler::new(&w);
+        for (i, &source) in order.iter().enumerate() {
+            s.barrier(&[source], Vec::new());
+            let expected = if i + 1 == sources {
+                vec![sources]
+            } else {
+                Vec::new()
+            };
+            prop_assert_eq!(s.plan(), expected);
+        }
+    }
+
+    /// A barrier that fired, however its sources' arrivals were grouped into
+    /// steps, resets once its target runs, its version bumping so a later
+    /// round fires it again, and is then no longer a candidate.
+    #[proptest]
+    fn a_fired_barrier_resets_and_bumps_its_version(
+        #[strategy(2..=5usize)] sources: usize,
+        /// The step each source arrives in.
+        #[strategy(prop::collection::vec(0..#sources, #sources))]
+        steps: Vec<usize>,
+    ) {
+        let (target, barrier) = (sources, sources + 1);
+        let w = one_join(sources);
+        let mut s = Scheduler::new(&w);
+        for step in in_steps(&(0..sources).collect::<Vec<_>>(), &steps) {
+            s.barrier(&step, Vec::new());
+        }
+        prop_assert_eq!(s.plan(), vec![target]);
+        let fired = s.versions[barrier];
+        s.barrier(&[target], Vec::new());
+        prop_assert_eq!(&s.arrived[barrier], &vec![false; sources]);
+        prop_assert_eq!(s.count[barrier], 0);
+        prop_assert!(s.versions[barrier] > fired);
+        prop_assert!(s.plan().is_empty());
+    }
+
+    /// A source that arrives again before its join's target runs, whether
+    /// the barrier is partial or complete, leaves the barrier's arrivals, its
+    /// count and every version unchanged.
+    #[proptest]
+    fn a_repeated_arrival_changes_nothing(
+        #[strategy(2..=5usize)] sources: usize,
+        /// The sources that arrive first.
+        #[strategy(prop::sample::subsequence((0..#sources).collect::<Vec<usize>>(), 1..=#sources))]
+        arrived: Vec<usize>,
+        /// The sources that arrive again.
+        #[strategy(prop::sample::subsequence(#arrived.clone(), 1..=#arrived.len()))]
+        again: Vec<usize>,
+    ) {
+        let w = one_join(sources);
+        let mut s = Scheduler::new(&w);
+        s.barrier(&arrived, Vec::new());
+        // `updated` is left out: the second step completes nothing, so it
+        // updates nothing, even when the first completed the barrier.
+        let before = (s.versions.clone(), s.arrived.clone(), s.count.clone());
+        s.barrier(&again, Vec::new());
+        prop_assert_eq!((s.versions, s.arrived, s.count), before);
+    }
+
+    /// A node triggered in one step by both an edge and a join is planned
+    /// once, whichever source has the edge.
+    #[proptest]
+    fn an_edge_and_a_join_into_one_node_plan_it_once(
+        #[strategy(2..=5usize)] sources: usize,
+        /// The source with an edge to the target as well.
+        #[strategy(0..#sources)]
+        edge: usize,
+    ) {
+        let (target, barrier) = (sources, sources + 1);
+        let mut successors = vec![Vec::new(); sources + 1];
+        successors[edge] = vec![target];
+        let w = join_wiring(
+            successors,
+            Vec::new(),
+            vec![((0..sources).collect(), target)],
+        );
+        let mut s = Scheduler::new(&w);
+        s.barrier(&others(sources, &[edge]), Vec::new());
+        s.barrier(&[edge], s.written_by(&[edge]));
+        prop_assert_eq!(
+            &s.updated,
+            &vec![target, barrier],
+            "the edge's channel and the barrier"
+        );
+        prop_assert_eq!(s.plan(), vec![target]);
+    }
+
+    /// A barrier some sources have arrived at, but not all, however their
+    /// arrivals are grouped into steps, is no candidate.
+    #[proptest]
+    fn a_partial_barrier_is_not_a_candidate(
+        #[strategy(2..=5usize)] sources: usize,
+        /// The sources that arrive: some, never all.
+        #[strategy(prop::sample::subsequence((0..#sources).collect::<Vec<usize>>(), 1..#sources))]
+        partial: Vec<usize>,
+        /// The step each of them arrives in.
+        #[strategy(prop::collection::vec(0..#sources, #partial.len()))]
+        steps: Vec<usize>,
+    ) {
+        let w = one_join(sources);
+        let mut s = Scheduler::new(&w);
+        for step in in_steps(&partial, &steps) {
+            s.barrier(&step, Vec::new());
+            prop_assert_eq!(&s.updated, &Vec::<usize>::new());
+            prop_assert!(s.plan().is_empty());
+        }
+    }
+
+    /// A barrier keeps its arrivals when its target runs through another
+    /// channel while it is partial, whichever sources have arrived: only a
+    /// complete barrier is consumed.
+    #[proptest]
+    fn a_partial_barrier_survives_its_target_running_through_another_channel(
+        #[strategy(2..=5usize)] sources: usize,
+        /// The sources that arrive: some, never all.
+        #[strategy(prop::sample::subsequence((0..#sources).collect::<Vec<usize>>(), 1..#sources))]
+        partial: Vec<usize>,
+        /// The arrived source that also has an edge to the target.
+        #[strategy(prop::sample::select(#partial.clone()))]
+        edge: usize,
+    ) {
+        let (target, barrier) = (sources, sources + 1);
+        let mut successors = vec![Vec::new(); sources + 1];
+        successors[edge] = vec![target];
+        let w = join_wiring(
+            successors,
+            Vec::new(),
+            vec![((0..sources).collect(), target)],
+        );
+        let mut s = Scheduler::new(&w);
+        s.barrier(&partial, s.written_by(&partial));
+        prop_assert_eq!(s.plan(), vec![target], "through the edge");
+        s.barrier(&[target], Vec::new());
+        prop_assert_eq!(
+            &s.arrived[barrier],
+            &(0..sources)
+                .map(|i| partial.contains(&i))
+                .collect::<Vec<bool>>()
+        );
+        s.barrier(&others(sources, &partial), Vec::new());
+        prop_assert_eq!(
+            s.plan(),
+            vec![target],
+            "through the join, which kept the earlier arrivals"
+        );
+    }
+
+    /// A source that runs in the step its join fires counts towards the
+    /// join's next round, whichever sources run again and in whatever order
+    /// the step lists its tasks: the barrier is consumed before the step's
+    /// arrivals are recorded.
+    #[proptest]
+    fn a_source_that_runs_as_its_join_fires_counts_for_the_next_round(
+        #[strategy(2..=5usize)] sources: usize,
+        /// The sources that run again alongside the target: some, never all.
+        #[strategy(prop::sample::subsequence((0..#sources).collect::<Vec<usize>>(), 1..#sources))]
+        rerun: Vec<usize>,
+        /// The step's tasks: the rerun sources and the target, in any order.
+        #[strategy(Just(#rerun.iter().copied().chain(once(#sources)).collect::<Vec<usize>>()).prop_shuffle())]
+        ran: Vec<usize>,
+    ) {
+        let target = sources;
+        let w = one_join(sources);
+        let mut s = Scheduler::new(&w);
+        s.barrier(&(0..sources).collect::<Vec<_>>(), Vec::new());
+        prop_assert_eq!(s.plan(), vec![target]);
+        s.barrier(&ran, Vec::new());
+        prop_assert!(
+            s.plan().is_empty(),
+            "only the rerun sources have arrived since the target ran"
+        );
+        s.barrier(&others(sources, &rerun), Vec::new());
+        prop_assert_eq!(s.plan(), vec![target]);
     }
 }

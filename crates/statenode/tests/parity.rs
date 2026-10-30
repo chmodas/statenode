@@ -15,11 +15,14 @@ mod support {
 use crate::support::common::{GraphSpec, sorted};
 
 /// A graph of up to 16 nodes in which every node is reachable: each node but
-/// the first in `order` has an edge from a node before it. On top of those,
-/// any node may fan out to more nodes or to `END`, including back to earlier
-/// nodes, so cycles appear; and `START` may lead to more nodes. Each node
-/// yields a random number of times, so the tasks of a step complete in
-/// varying orders. No edge is listed twice, since every edge list is a set.
+/// the first in `order` has an edge from a node before it, or, if `joined`
+/// says so and two nodes come before it, a join of two of them instead, so
+/// some nodes are reached only through a join. On top of those, any node may
+/// fan out to more nodes or to `END`, including back to earlier nodes, so
+/// cycles appear; `START` may lead to more nodes; and more joins may lead
+/// anywhere. Each node yields a random number of times, so the tasks of a
+/// step complete in varying orders. No edge or join is listed twice, since
+/// every list of them is a set.
 #[derive(Debug, Arbitrary)]
 struct Case {
     /// The number of nodes.
@@ -32,6 +35,22 @@ struct Case {
     /// it (ignored for the first).
     #[strategy(prop::collection::vec(any::<prop::sample::Index>(), #len))]
     parents: Vec<prop::sample::Index>,
+    /// For the `i`th node in `order`, whether it is reached through a join
+    /// of its parent and a second earlier node instead (from the third node
+    /// on).
+    #[strategy(prop::collection::vec(any::<bool>(), #len))]
+    joined: Vec<bool>,
+    /// For the `i`th node in `order`, which earlier node joins its parent,
+    /// when it is reached through a join.
+    #[strategy(prop::collection::vec(any::<prop::sample::Index>(), #len))]
+    co_parents: Vec<prop::sample::Index>,
+    /// More joins, each its sources and target by node index; those with
+    /// fewer than two sources are dropped.
+    #[strategy(prop::collection::btree_set(
+        (prop::collection::btree_set(0..#len, 0..=3), 0..#len),
+        0..3
+    ))]
+    extra_joins: BTreeSet<(BTreeSet<usize>, usize)>,
     /// More edges from each node, by node index: 0 is `END`, `k` is node
     /// `k - 1`.
     #[strategy(prop::collection::vec(prop::collection::btree_set(0..=#len, 0..3), #len))]
@@ -56,17 +75,33 @@ impl Case {
             .iter()
             .map(|ends| ends.iter().map(|&k| end(k)).collect())
             .collect();
-        let tree = self
-            .parents
+        let mut joins: BTreeSet<(BTreeSet<usize>, usize)> = self
+            .extra_joins
             .iter()
-            .enumerate()
-            .skip(1)
-            .filter_map(|(i, parent)| {
-                Some((*self.order.get(parent.index(i))?, *self.order.get(i)?))
-            });
-        for (parent, child) in tree {
-            if let Some(ends) = successors.get_mut(parent) {
-                ends.insert(Some(child));
+            .filter(|(sources, _)| sources.len() >= 2)
+            .cloned()
+            .collect();
+        for (i, parent) in self.parents.iter().enumerate().skip(1) {
+            let (Some(&parent), Some(&child)) =
+                (self.order.get(parent.index(i)), self.order.get(i))
+            else {
+                continue;
+            };
+            let co_parent = self
+                .co_parents
+                .get(i)
+                .and_then(|co| self.order.get(co.index(i)))
+                .copied()
+                .filter(|&co| co != parent);
+            match (self.joined.get(i), co_parent) {
+                (Some(true), Some(co)) => {
+                    joins.insert((BTreeSet::from([parent, co]), child));
+                }
+                _ => {
+                    if let Some(ends) = successors.get_mut(parent) {
+                        ends.insert(Some(child));
+                    }
+                }
             }
         }
         let start: BTreeSet<Option<usize>> = self
@@ -82,6 +117,10 @@ impl Case {
             successors: successors
                 .into_iter()
                 .map(|ends| ends.into_iter().collect())
+                .collect(),
+            joins: joins
+                .into_iter()
+                .map(|(sources, target)| (sources.into_iter().collect(), target))
                 .collect(),
             yields: self.yields.clone(),
         }

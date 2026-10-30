@@ -1,10 +1,10 @@
-//! [`Topology`]: a graph's names and edges, and every check on them, and the
-//! [`ValidTopology`] it produces.
+//! [`Topology`]: a graph's names, edges and joins, and every check on them,
+//! and the [`ValidTopology`] it produces.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{BuildError, NodeId, Source, Target};
+use super::{BuildError, NodeId, Source, Sources, Target};
 use crate::name::{NameError, NodeName};
 use crate::state::ChannelSpec;
 
@@ -34,6 +34,12 @@ pub(crate) struct Topology {
     pub(super) edges: Vec<Edge>,
     /// The same edges, for duplicate detection.
     declared: HashSet<Edge>,
+    /// Joins, in the order they were added. Visible to the builder, whose
+    /// tests check what its `add_edge` records.
+    pub(super) joins: Vec<Join>,
+    /// The same joins for duplicate detection: their sources are in name
+    /// order, so a join repeated in another order is the same.
+    declared_joins: HashSet<Join>,
 }
 
 /// An edge, by node index.
@@ -65,6 +71,31 @@ fn end_name<'a>(names: &'a [NodeName], index: Option<usize>, boundary: &'a str) 
         .map_or(boundary, NodeName::as_str)
 }
 
+/// A join, by node index: it fires, and `target` runs, once every source has
+/// run since it last fired.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Join {
+    /// The source nodes, in name order.
+    pub(crate) sources: Vec<usize>,
+    /// The target node.
+    pub(crate) target: usize,
+}
+
+impl Join {
+    /// The join as `join:a+b:c`, the name of its barrier channel: its sources
+    /// in name order, joined by `+`, then its target, all named from `names`.
+    fn describe(&self, names: &[NodeName]) -> String {
+        let sources: Vec<&str> = self
+            .sources
+            .iter()
+            .filter_map(|&source| names.get(source))
+            .map(NodeName::as_str)
+            .collect();
+        let target = names.get(self.target).map_or("", NodeName::as_str);
+        format!("join:{}:{target}", sources.join("+"))
+    }
+}
+
 impl Topology {
     /// An empty topology with a fresh tag.
     pub(crate) fn new() -> Self {
@@ -74,6 +105,8 @@ impl Topology {
             known: HashSet::new(),
             edges: Vec::new(),
             declared: HashSet::new(),
+            joins: Vec::new(),
+            declared_joins: HashSet::new(),
         }
     }
 
@@ -110,14 +143,28 @@ impl Topology {
         }
     }
 
-    /// Records the edge `from → to`.
+    /// Records the edge `from → to`, a plain edge or a join.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first problem found, in the order documented on
+    /// [`GraphBuilder::add_edge`](crate::GraphBuilder::add_edge). A rejected
+    /// edge is not recorded.
+    pub(crate) fn add_edge(&mut self, from: Sources, to: Target) -> Result<(), BuildError> {
+        match from {
+            Sources::One(source) => self.add_plain_edge(source, to),
+            Sources::Join(sources) => self.add_join(&sources, to),
+        }
+    }
+
+    /// Records the plain edge `from → to`.
     ///
     /// # Errors
     ///
     /// Returns [`BuildError::ForeignNode`] if either end is a handle from
     /// another builder, then [`BuildError::DuplicateEdge`] if the edge was
-    /// already added. A rejected edge is not recorded.
-    pub(crate) fn add_edge(&mut self, from: Source, to: Target) -> Result<(), BuildError> {
+    /// already added.
+    fn add_plain_edge(&mut self, from: Source, to: Target) -> Result<(), BuildError> {
         let from = match from {
             Source::Start => None,
             Source::Node(node) => Some(self.resolve(node)?),
@@ -133,6 +180,54 @@ impl Topology {
             });
         }
         self.edges.push(edge);
+        Ok(())
+    }
+
+    /// Records the join of `sources` into `to`.
+    ///
+    /// # Errors
+    ///
+    /// In this order: [`BuildError::ForeignNode`] for a source, in list
+    /// order, then for the target; [`BuildError::EmptyJoin`];
+    /// [`BuildError::SingleSourceJoin`]; [`BuildError::DuplicateJoinSource`]
+    /// for the first node to appear a second time; [`BuildError::JoinToEnd`];
+    /// then [`BuildError::DuplicateEdge`] if the same sources already join
+    /// into the same target.
+    fn add_join(&mut self, sources: &[NodeId], to: Target) -> Result<(), BuildError> {
+        let mut sources = sources
+            .iter()
+            .map(|&node| self.resolve(node))
+            .collect::<Result<Vec<usize>, _>>()?;
+        let target = match to {
+            Target::Node(node) => Some(self.resolve(node)?),
+            Target::End => None,
+        };
+        let named: Vec<(usize, &NodeName)> = sources
+            .iter()
+            .filter_map(|&source| self.names.get(source).map(|name| (source, name)))
+            .collect();
+        match named.as_slice() {
+            [] => return Err(BuildError::EmptyJoin),
+            [(_, name)] => {
+                return Err(BuildError::SingleSourceJoin {
+                    node: (*name).clone(),
+                });
+            }
+            _ => {}
+        }
+        let mut seen = HashSet::new();
+        if let Some(&(_, name)) = named.iter().find(|&&(source, _)| !seen.insert(source)) {
+            return Err(BuildError::DuplicateJoinSource { node: name.clone() });
+        }
+        let target = target.ok_or(BuildError::JoinToEnd)?;
+        sources.sort_unstable_by_key(|&source| self.names.get(source));
+        let join = Join { sources, target };
+        if !self.declared_joins.insert(join.clone()) {
+            return Err(BuildError::DuplicateEdge {
+                edge: join.describe(&self.names),
+            });
+        }
+        self.joins.push(join);
         Ok(())
     }
 
@@ -169,7 +264,7 @@ impl Topology {
         let mut by_name: Vec<(&NodeName, usize)> = self.names.iter().zip(0..).collect();
         by_name.sort_unstable();
 
-        let reached = reachable(&start_targets, &outgoing, self.names.len());
+        let reached = reachable(&start_targets, &outgoing, &self.joins, self.names.len());
         let unreachable = by_name
             .iter()
             .find(|&&(_, node)| reached.get(node).is_some_and(|&r| !r));
@@ -185,6 +280,7 @@ impl Topology {
                 .into_iter()
                 .map(|edges| edges.into_iter().flatten().collect())
                 .collect(),
+            joins: self.joins,
             names: self.names,
         })
     }
@@ -192,13 +288,30 @@ impl Topology {
 
 /// Which nodes can be reached from `START`, by node index.
 ///
-/// An iterative walk, so a long chain cannot overflow the stack.
+/// A join's target is reached once every one of its sources is: each join
+/// counts down as its sources are first reached, and at zero reaches its
+/// target. An iterative walk, so a long chain cannot overflow the stack, and
+/// linear in the nodes, edges and join sources.
 fn reachable(
     start_targets: &[Option<usize>],
     outgoing: &[Vec<Option<usize>>],
+    joins: &[Join],
     len: usize,
 ) -> Vec<bool> {
     let mut reached = vec![false; len];
+    // Joins list each source once (`add_edge` rejects repeats), and a node
+    // counts its joins down only on its first visit, so no count goes below
+    // zero.
+    let mut waiting: Vec<usize> = joins.iter().map(|join| join.sources.len()).collect();
+    let mut joins_of: Vec<Vec<usize>> = vec![Vec::new(); len];
+    for (index, join) in joins.iter().enumerate() {
+        for &source in &join.sources {
+            joins_of
+                .get_mut(source)
+                .into_iter()
+                .for_each(|of| of.push(index));
+        }
+    }
     let mut pending: Vec<usize> = start_targets.iter().flatten().copied().collect();
     while let Some(node) = pending.pop() {
         let first_visit = reached
@@ -206,6 +319,18 @@ fn reachable(
             .is_some_and(|seen| !std::mem::replace(seen, true));
         if first_visit {
             pending.extend(outgoing.get(node).into_iter().flatten().flatten().copied());
+            for &index in joins_of.get(node).into_iter().flatten() {
+                let complete = waiting.get_mut(index).is_some_and(|left| {
+                    *left -= 1;
+                    *left == 0
+                });
+                pending.extend(
+                    joins
+                        .get(index)
+                        .filter(|_| complete)
+                        .map(|join| join.target),
+                );
+            }
         }
     }
     reached
@@ -246,6 +371,9 @@ pub(crate) struct ValidTopology {
     /// The nodes each node leads to, by node index; edges to `END` are left
     /// out.
     pub(crate) successors: Vec<Vec<usize>>,
+    /// The joins, in the order they were declared, each with its sources in
+    /// name order.
+    pub(crate) joins: Vec<Join>,
 }
 
 #[cfg(test)]
@@ -272,8 +400,10 @@ mod tests {
     /// A minimal valid topology: `START → a → END`.
     fn valid() -> Topology {
         let (mut t, ids) = topology(&["a"]);
-        t.add_edge(Source::Start, Target::Node(ids[0])).unwrap();
-        t.add_edge(Source::Node(ids[0]), Target::End).unwrap();
+        t.add_edge(Source::Start.into(), Target::Node(ids[0]))
+            .unwrap();
+        t.add_edge(Source::Node(ids[0]).into(), Target::End)
+            .unwrap();
         t
     }
 
@@ -347,6 +477,8 @@ mod tests {
             names,
             edges: Vec::new(),
             declared: HashSet::new(),
+            joins: Vec::new(),
+            declared_joins: HashSet::new(),
         };
         // Node 0 exists in both builders, so only the tag tells them apart.
         let own = NodeId {
@@ -363,9 +495,10 @@ mod tests {
             (Source::Start, Target::Node(foreign)),
             (Source::Node(foreign), Target::End),
         ] {
-            prop_assert_eq!(t.add_edge(from, to), Err(BuildError::ForeignNode));
+            prop_assert_eq!(t.add_edge(from.into(), to), Err(BuildError::ForeignNode));
         }
         prop_assert!(t.edges.is_empty() && t.declared.is_empty());
+        prop_assert!(t.joins.is_empty() && t.declared_joins.is_empty());
     }
 
     /// Every combination of this builder's ends is accepted, `START` or a
@@ -384,7 +517,7 @@ mod tests {
             (a, to_a),
         ];
         for (from, to) in edges {
-            assert_eq!(t.add_edge(from, to), Ok(()));
+            assert_eq!(t.add_edge(from.into(), to), Ok(()));
         }
         let edge = |from, to| Edge { from, to };
         assert_eq!(
@@ -448,7 +581,7 @@ mod tests {
             } else {
                 Ok(())
             };
-            prop_assert_eq!(t.add_edge(sources[from], targets[to]), expected);
+            prop_assert_eq!(t.add_edge(sources[from].into(), targets[to]), expected);
         }
         prop_assert_eq!(
             &t.declared,
@@ -482,6 +615,232 @@ mod tests {
         prop_assert_eq!(describe(None, None), "START → END");
     }
 
+    // --- add_join ------------------------------------------------------------
+
+    /// Four nodes, `n0` to `n3`, and their handles.
+    fn four() -> (Topology, Vec<NodeId>) {
+        topology(&["n0", "n1", "n2", "n3"])
+    }
+
+    /// A join of `sources` into `target`.
+    fn join(t: &mut Topology, sources: &[NodeId], target: Target) -> Result<(), BuildError> {
+        t.add_edge(Sources::Join(sources.to_vec()), target)
+    }
+
+    /// A join reads `join:a+b:c`, its sources in name order and joined by
+    /// `+`, whatever order they were given in and whatever the names.
+    #[proptest]
+    fn describes_joins_by_their_sources_in_name_order(
+        #[strategy(
+            prop::collection::btree_set(valid_name(MAX_NAME_LEN), 3..6)
+                .prop_map(Vec::from_iter)
+                .prop_shuffle()
+        )]
+        names: Vec<String>,
+        /// The join's sources, as given: all but the last node, shuffled.
+        #[strategy(Just((0..#names.len() - 1).collect::<Vec<usize>>()).prop_shuffle())]
+        sources: Vec<usize>,
+    ) {
+        let (mut t, ids) = topology(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let target = names.len() - 1;
+        let given: Vec<NodeId> = sources.iter().map(|&i| ids[i]).collect();
+        join(&mut t, &given, Target::Node(ids[target])).unwrap();
+        let mut by_name: Vec<&str> = sources.iter().map(|&i| names[i].as_str()).collect();
+        by_name.sort_unstable();
+        prop_assert_eq!(
+            t.joins[0].describe(&t.names),
+            format!("join:{}:{}", by_name.join("+"), names[target])
+        );
+    }
+
+    /// A handle from another builder is rejected anywhere among a join's
+    /// sources, or as its target, and nothing is recorded.
+    #[proptest]
+    fn rejects_a_foreign_handle_in_a_join(
+        #[strategy(distinct_tags())] tags: (u64, u64),
+        /// Where the foreign source goes among two of this builder's.
+        #[strategy(0..=2usize)]
+        at: usize,
+    ) {
+        let (mut t, ids) = four();
+        t.tag = tags.0;
+        let own: Vec<NodeId> = ids
+            .iter()
+            .map(|id| NodeId {
+                index: id.index,
+                builder: tags.0,
+            })
+            .collect();
+        let foreign = NodeId {
+            index: 0,
+            builder: tags.1,
+        };
+        let mut sources = vec![own[0], own[1]];
+        sources.insert(at, foreign);
+        prop_assert_eq!(
+            join(&mut t, &sources, Target::Node(own[3])),
+            Err(BuildError::ForeignNode)
+        );
+        prop_assert_eq!(
+            join(&mut t, &own[..2], Target::Node(foreign)),
+            Err(BuildError::ForeignNode)
+        );
+        prop_assert!(t.joins.is_empty());
+    }
+
+    /// A join without sources is rejected, whatever its target.
+    #[test]
+    fn rejects_an_empty_join() {
+        let (mut t, ids) = four();
+        assert_eq!(
+            join(&mut t, &[], Target::Node(ids[0])),
+            Err(BuildError::EmptyJoin)
+        );
+        assert_eq!(join(&mut t, &[], Target::End), Err(BuildError::EmptyJoin));
+    }
+
+    /// A join of one source is rejected, naming it, whether it leads to a
+    /// node or to `END`.
+    #[proptest]
+    fn rejects_a_single_source_join(
+        /// The one source.
+        #[strategy(0..4usize)]
+        source: usize,
+        /// The node target, tried alongside `END`.
+        #[strategy(0..4usize)]
+        target: usize,
+    ) {
+        let (mut t, ids) = four();
+        let expected = Err(BuildError::SingleSourceJoin {
+            node: name(&format!("n{source}")),
+        });
+        prop_assert_eq!(
+            join(&mut t, &[ids[source]], Target::Node(ids[target])),
+            expected.clone()
+        );
+        prop_assert_eq!(join(&mut t, &[ids[source]], Target::End), expected);
+    }
+
+    /// A join that lists a node twice is rejected, naming the first node to
+    /// appear a second time: of the two repeats appended to distinct
+    /// sources, the first.
+    #[proptest]
+    fn rejects_a_repeated_join_source(
+        /// The distinct sources, in the order given.
+        #[strategy(prop::sample::subsequence((0..4usize).collect::<Vec<_>>(), 2..=4).prop_shuffle())]
+        sources: Vec<usize>,
+        /// The source repeated first.
+        #[strategy(0..#sources.len())]
+        first: usize,
+        /// How far after `first`, wrapping, the source repeated second is.
+        #[strategy(1..#sources.len())]
+        offset: usize,
+    ) {
+        let (mut t, ids) = four();
+        let second = (first + offset) % sources.len();
+        let given: Vec<NodeId> = sources
+            .iter()
+            .chain([&sources[first], &sources[second]])
+            .map(|&i| ids[i])
+            .collect();
+        prop_assert_eq!(
+            join(&mut t, &given, Target::End),
+            Err(BuildError::DuplicateJoinSource {
+                node: name(&format!("n{}", sources[first]))
+            })
+        );
+    }
+
+    /// A join into `END` is rejected.
+    #[proptest]
+    fn rejects_a_join_to_end(
+        #[strategy(prop::sample::subsequence((0..4usize).collect::<Vec<_>>(), 2..=4).prop_shuffle())]
+        sources: Vec<usize>,
+    ) {
+        let (mut t, ids) = four();
+        let given: Vec<NodeId> = sources.iter().map(|&i| ids[i]).collect();
+        prop_assert_eq!(
+            join(&mut t, &given, Target::End),
+            Err(BuildError::JoinToEnd)
+        );
+    }
+
+    /// The same sources joining into the same target a second time, in any
+    /// order, are a duplicate edge, named by the join's form, and not
+    /// recorded again.
+    #[proptest]
+    fn rejects_a_repeated_join_whatever_its_order(
+        /// The join's sources, as first given.
+        #[strategy(prop::sample::subsequence((0..3usize).collect::<Vec<_>>(), 2..=3).prop_shuffle())]
+        sources: Vec<usize>,
+        /// The same sources, as given again.
+        #[strategy(Just(#sources.clone()).prop_shuffle())]
+        again: Vec<usize>,
+    ) {
+        let (mut t, ids) = four();
+        let given = |order: &[usize]| order.iter().map(|&i| ids[i]).collect::<Vec<_>>();
+        join(&mut t, &given(&sources), Target::Node(ids[3])).unwrap();
+        // The form is pinned by `describes_joins_by_their_sources_in_name_order`.
+        let edge = t.joins[0].describe(&t.names);
+        prop_assert_eq!(
+            join(&mut t, &given(&again), Target::Node(ids[3])),
+            Err(BuildError::DuplicateEdge { edge })
+        );
+        prop_assert_eq!(t.joins.len(), 1);
+    }
+
+    /// A join and a plain edge into the same node are different edges.
+    #[test]
+    fn a_join_beside_a_plain_edge_is_not_a_duplicate() {
+        let (mut t, ids) = four();
+        t.add_edge(Source::Node(ids[0]).into(), Target::Node(ids[2]))
+            .unwrap();
+        assert_eq!(join(&mut t, &ids[..2], Target::Node(ids[2])), Ok(()));
+        assert_eq!((t.edges.len(), t.joins.len()), (1, 1));
+    }
+
+    /// When a join fails several checks, the first in the documented order is
+    /// reported. Each case below also fails every later check it can.
+    #[test]
+    fn reports_the_first_join_check_that_fails() {
+        let (mut t, ids) = four();
+        let foreign = NodeId {
+            index: 0,
+            builder: t.tag.wrapping_add(1),
+        };
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        // A foreign target, and no sources at all.
+        assert_eq!(
+            join(&mut t, &[], Target::Node(foreign)),
+            Err(BuildError::ForeignNode)
+        );
+        // No sources, into END.
+        assert_eq!(join(&mut t, &[], Target::End), Err(BuildError::EmptyJoin));
+        // One source, into END.
+        assert_eq!(
+            join(&mut t, &[a], Target::End),
+            Err(BuildError::SingleSourceJoin { node: name("n0") })
+        );
+        // A repeated source, into END.
+        assert_eq!(
+            join(&mut t, &[a, a], Target::End),
+            Err(BuildError::DuplicateJoinSource { node: name("n0") })
+        );
+        // Distinct sources, into END.
+        assert_eq!(
+            join(&mut t, &[a, b], Target::End),
+            Err(BuildError::JoinToEnd)
+        );
+        // A valid join, then the same again.
+        join(&mut t, &[a, b], Target::Node(c)).unwrap();
+        assert_eq!(
+            join(&mut t, &[b, a], Target::Node(c)),
+            Err(BuildError::DuplicateEdge {
+                edge: "join:n0+n1:n2".to_owned()
+            })
+        );
+    }
+
     // --- validate ------------------------------------------------------------
 
     /// Channel names for the properties, valid and invalid; `validate_name`
@@ -507,7 +866,7 @@ mod tests {
             .chain(ids.iter().copied().map(Target::Node))
             .collect();
         for &(from, to) in edges {
-            t.add_edge(sources[from], targets[to]).unwrap();
+            t.add_edge(sources[from].into(), targets[to]).unwrap();
         }
         t
     }
@@ -528,11 +887,38 @@ mod tests {
         names.iter().copied().map(ChannelSpec::new).collect()
     }
 
+    /// [`build`]'s topology, plus the join of `sources` into `target`, by
+    /// node index.
+    fn build_with_join(
+        names: &[String],
+        edges: &[(usize, usize)],
+        sources: &[usize],
+        target: usize,
+    ) -> Topology {
+        let mut t = build(names, edges);
+        let id = |index| NodeId {
+            index,
+            builder: t.tag,
+        };
+        let join = Sources::Join(sources.iter().map(|&i| id(i)).collect());
+        t.add_edge(join, Target::Node(id(target))).unwrap();
+        t
+    }
+
+    /// Nodes `n0` to `n{sources-1}`, which joins draw on, then a target named
+    /// `a`, which sorts before them all.
+    fn join_names(sources: usize) -> Vec<String> {
+        (0..sources)
+            .map(|i| format!("n{i}"))
+            .chain(std::iter::once(String::from("a")))
+            .collect()
+    }
+
     /// A graph without nodes is rejected as empty.
     #[test]
     fn rejects_an_empty_graph() {
         let mut t = Topology::new();
-        t.add_edge(Source::Start, Target::End).unwrap();
+        t.add_edge(Source::Start.into(), Target::End).unwrap();
         assert_eq!(
             t.validate(specs(&["value"])).unwrap_err(),
             BuildError::Empty
@@ -678,7 +1064,8 @@ mod tests {
     #[test]
     fn accepts_a_reached_node_without_an_outgoing_edge() {
         let (mut t, ids) = topology(&["a"]);
-        t.add_edge(Source::Start, Target::Node(ids[0])).unwrap();
+        t.add_edge(Source::Start.into(), Target::Node(ids[0]))
+            .unwrap();
         assert!(t.validate(specs(&["value"])).is_ok());
     }
 
@@ -689,10 +1076,10 @@ mod tests {
         // Declared out of name order: c, a, b. START → c → a → b → a (a cycle).
         let (mut t, ids) = topology(&["c", "a", "b"]);
         let (c, a, b) = (ids[0], ids[1], ids[2]);
-        t.add_edge(Source::Start, Target::Node(c)).unwrap();
-        t.add_edge(Source::Node(c), Target::Node(a)).unwrap();
-        t.add_edge(Source::Node(a), Target::Node(b)).unwrap();
-        t.add_edge(Source::Node(b), Target::Node(a)).unwrap();
+        t.add_edge(Source::Start.into(), Target::Node(c)).unwrap();
+        t.add_edge(Source::Node(c).into(), Target::Node(a)).unwrap();
+        t.add_edge(Source::Node(a).into(), Target::Node(b)).unwrap();
+        t.add_edge(Source::Node(b).into(), Target::Node(a)).unwrap();
         let topology = t.validate(specs(&["value"])).unwrap();
         assert_eq!(topology.start, vec![0]);
         assert_eq!(topology.successors, vec![vec![1], vec![2], vec![1]]);
@@ -727,6 +1114,64 @@ mod tests {
                 .err(),
             validate_channels(specs).err()
         );
+    }
+
+    /// A node reached only through a join is reached once every one of the
+    /// join's sources is.
+    #[proptest]
+    fn a_join_target_is_reached_once_every_source_is(
+        #[strategy(2..=5usize)] _sources: usize,
+        /// A chain through every source.
+        #[strategy(Just((0..#_sources).collect::<Vec<usize>>()).prop_shuffle())]
+        path: Vec<usize>,
+        /// The join's sources.
+        #[strategy(prop::sample::subsequence((0..#_sources).collect::<Vec<usize>>(), 2..=#_sources))]
+        joined: Vec<usize>,
+    ) {
+        let target = path.len();
+        let t = build_with_join(&join_names(target), &chain(&path), &joined, target);
+        prop_assert!(t.validate(specs(&["count"])).is_ok());
+    }
+
+    /// A node reached only through a join is unreachable while one of the
+    /// join's sources is: the target, named to sort first, is reported.
+    #[proptest]
+    fn a_join_target_is_unreachable_unless_every_source_is(
+        #[strategy(2..=5usize)] _sources: usize,
+        /// A chain through every source, the last of which is left off it.
+        #[strategy(Just((0..#_sources).collect::<Vec<usize>>()).prop_shuffle())]
+        path: Vec<usize>,
+    ) {
+        let target = path.len();
+        let (missing, reached) = path.split_last().unwrap();
+        let mut edges = chain(reached);
+        edges.push((missing + 1, 0));
+        let t = build_with_join(&join_names(target), &edges, &path, target);
+        prop_assert_eq!(
+            t.validate(specs(&["count"])).err(),
+            Some(BuildError::Unreachable { node: name("a") })
+        );
+    }
+
+    /// A validated topology keeps each join with its sources in name order,
+    /// whatever order they were given in.
+    #[proptest]
+    fn keeps_joins_with_sources_in_name_order(
+        #[strategy(2..=5usize)] _sources: usize,
+        /// The node names `n{order[i]}`, so name order is not index order.
+        #[strategy(Just((0..=#_sources).collect::<Vec<usize>>()).prop_shuffle())]
+        order: Vec<usize>,
+        /// The join's sources, as given: every node but the last, shuffled.
+        #[strategy(Just((0..#_sources).collect::<Vec<usize>>()).prop_shuffle())]
+        joined: Vec<usize>,
+    ) {
+        let target = joined.len();
+        let names = names(&order);
+        let t = build_with_join(&names, &chain(&joined), &joined, target);
+        let valid = t.validate(specs(&["count"])).unwrap();
+        let mut by_name = joined.clone();
+        by_name.sort_unstable_by_key(|&i| names[i].clone());
+        prop_assert_eq!(&valid.joins[0].sources, &by_name);
     }
 
     // --- reachable -----------------------------------------------------------
@@ -774,7 +1219,10 @@ mod tests {
         for &node in inside {
             expected[node] = true;
         }
-        prop_assert_eq!(reachable(&[Some(inside[0]), None], &outgoing, n), expected);
+        prop_assert_eq!(
+            reachable(&[Some(inside[0]), None], &outgoing, &[], n),
+            expected
+        );
     }
 
     /// Reachability walks a 100 thousand-node chain without overflowing the stack.
@@ -784,7 +1232,41 @@ mod tests {
         let outgoing: Vec<Vec<Option<usize>>> = (0..len)
             .map(|i| vec![if i + 1 < len { Some(i + 1) } else { None }])
             .collect();
-        assert!(reachable(&[Some(0)], &outgoing, len).into_iter().all(|r| r));
+        assert!(
+            reachable(&[Some(0)], &outgoing, &[], len)
+                .into_iter()
+                .all(|r| r)
+        );
+    }
+
+    /// Each join counts down once per source, on the source's first visit,
+    /// however often a cycle revisits it: the join of two sources in a cycle
+    /// reaches its target, and the join of a reached and an unreached source
+    /// does not.
+    #[test]
+    fn reachability_counts_each_join_down_once() {
+        // 0 ⇄ 1, and 3 is never reached.
+        let outgoing = vec![
+            vec![Some(1)],
+            vec![Some(0)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let joins = [
+            Join {
+                sources: vec![0, 1],
+                target: 2,
+            },
+            Join {
+                sources: vec![0, 3],
+                target: 4,
+            },
+        ];
+        assert_eq!(
+            reachable(&[Some(0)], &outgoing, &joins, 5),
+            vec![true, true, true, false, false]
+        );
     }
 
     // --- validate_channels ---------------------------------------------------

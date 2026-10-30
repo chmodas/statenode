@@ -84,9 +84,9 @@ impl State for Trace {
 
 /// A graph of `len` nodes, `n0` to `n{len-1}`, wired by node index.
 ///
-/// The spec does not remove repeats: an edge listed twice makes [`build`]
-/// fail with `DuplicateEdge`, so generators draw `start` and each node's
-/// `successors` from sets.
+/// The spec does not remove repeats: an edge or join listed twice makes
+/// [`build`] fail with `DuplicateEdge`, so generators draw `start`, each
+/// node's `successors`, and the joins from sets.
 ///
 /// [`build`]: Self::build
 #[derive(Debug, Clone)]
@@ -99,6 +99,8 @@ pub struct GraphSpec {
     /// Where each node leads, by node index: `Some(node)`, or `None` for
     /// `END`.
     pub successors: Vec<Vec<Option<usize>>>,
+    /// The joins, each its distinct sources and its target, by node index.
+    pub joins: Vec<(Vec<usize>, usize)>,
     /// How many times each node yields to the runtime before it finishes, so
     /// tests can vary the order in which a step's tasks complete. A node
     /// with no entry does not yield.
@@ -133,6 +135,7 @@ impl GraphSpec {
             successors: (0..len)
                 .map(|i| vec![if i + 1 < len { Some(i + 1) } else { cycle_to }])
                 .collect(),
+            joins: Vec::new(),
             yields: vec![0; len],
         }
     }
@@ -182,6 +185,13 @@ impl GraphSpec {
                 g.add_edge(from, target(end)?)?;
             }
         }
+        for (sources, to) in &self.joins {
+            let sources = sources
+                .iter()
+                .map(|&i| node(i))
+                .collect::<Result<Vec<NodeId>, _>>()?;
+            g.add_edge(sources, node(*to)?)?;
+        }
         Ok(g.compile()?)
     }
 
@@ -202,8 +212,15 @@ impl GraphSpec {
     }
 
     /// The naive reference interpreter. Each step runs, in name order, every
-    /// node an edge leads to from the nodes of the step before, starting from
+    /// node an edge leads to from the nodes of the step before, and every
+    /// node whose join has heard from all its sources, starting from
     /// `START`'s targets, until no node is left or the limit is reached.
+    ///
+    /// After each step, in this order: a complete join whose target ran is
+    /// reset, then the sources that ran arrive at their joins. A join
+    /// complete at the start of a step always had its target planned in that
+    /// step, so every complete join is reset before new arrivals, and the
+    /// joins complete afterwards are exactly those that fire next.
     pub fn interpret(&self, limit: u32) -> Reference {
         let limit = u64::from(limit);
         let mut planned: BTreeSet<(String, usize)> = self
@@ -212,6 +229,7 @@ impl GraphSpec {
             .flatten()
             .map(|&i| (Self::name(i), i))
             .collect();
+        let mut arrived: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.joins.len()];
         let mut visits = Vec::new();
         let mut trace = vec![String::from("input")];
         let mut step = 0;
@@ -231,9 +249,23 @@ impl GraphSpec {
                 });
                 trace.push(node.clone());
             }
-            planned = planned
+            let ran: BTreeSet<usize> = planned.iter().map(|&(_, i)| i).collect();
+            for ((sources, target), heard) in self.joins.iter().zip(&mut arrived) {
+                if ran.contains(target) && heard.len() == sources.len() {
+                    heard.clear();
+                }
+                heard.extend(sources.iter().filter(|source| ran.contains(source)));
+            }
+            let fired = self
+                .joins
                 .iter()
-                .flat_map(|&(_, i)| self.successors.get(i).into_iter().flatten().flatten())
+                .zip(&arrived)
+                .filter(|((sources, _), heard)| heard.len() == sources.len())
+                .map(|((_, target), _)| target);
+            planned = ran
+                .iter()
+                .flat_map(|&i| self.successors.get(i).into_iter().flatten().flatten())
+                .chain(fired)
                 .map(|&j| (Self::name(j), j))
                 .collect();
             step += 1;
