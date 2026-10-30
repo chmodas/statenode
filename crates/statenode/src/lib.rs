@@ -3,9 +3,10 @@
 //!
 //! A graph is a typed [`State`], a set of nodes that read a snapshot of the
 //! state and return updates, and edges between them. In each superstep, the
-//! nodes an edge leads to from the nodes that completed in the previous one
-//! run against the same snapshot, and their updates are applied together, in
-//! [`TaskPath`] order.
+//! nodes an edge leads to from the nodes that completed in the previous one,
+//! and the nodes whose joins (`add_edge([a, b], c)`) have heard from every
+//! source, run against the same snapshot, and their updates are applied
+//! together, in [`TaskPath`] order.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -100,7 +101,9 @@ mod task;
 #[cfg(test)]
 mod testing;
 
-pub use builder::{BuildError, END, End, GraphBuilder, NodeId, START, Source, Start, Target};
+pub use builder::{
+    BuildError, END, End, GraphBuilder, NodeId, START, Source, Sources, Start, Target,
+};
 pub use config::{DEFAULT_RECURSION_LIMIT, RunConfig};
 pub use engine::{CompiledGraph, RunError};
 pub use name::{MAX_NAME_LEN, NameError, NodeName};

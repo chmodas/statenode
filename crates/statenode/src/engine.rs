@@ -8,7 +8,8 @@
 //!    state, and wait for every one to finish.
 //! 3. **Apply** their updates in task-path order with
 //!    [`State::apply_step`], then close the step ([`Scheduler::barrier`]),
-//!    recording what it wrote so the next step can plan from it.
+//!    recording what it wrote, and which joins its tasks arrived at, so the
+//!    next step can plan from it.
 //!
 //! Which tasks a step plans is decided by the scheduler in [`pregel`], the
 //! one part of the engine tied to the scheduling algorithm.

@@ -23,9 +23,24 @@ pub enum BuildError {
     },
     /// A node handle from a different builder was used.
     ForeignNode,
+    /// A join was given no source nodes.
+    EmptyJoin,
+    /// A join was given one source node: that is a plain edge.
+    SingleSourceJoin {
+        /// The one source.
+        node: NodeName,
+    },
+    /// A join lists a source node more than once.
+    DuplicateJoinSource {
+        /// The node, the first in the list to appear a second time.
+        node: NodeName,
+    },
+    /// A join leads to `END`, which would run nothing.
+    JoinToEnd,
     /// The same edge was added twice.
     DuplicateEdge {
-        /// The edge, as `from → to`, with `START` and `END` for the boundaries.
+        /// The edge, as `from → to`, with `START` and `END` for the boundaries,
+        /// or as `join:a+b:c` for a join, its sources in name order.
         edge: String,
     },
     /// The graph has no nodes.
@@ -55,6 +70,15 @@ impl fmt::Display for BuildError {
             Self::ForeignNode => {
                 f.write_str("the node handle belongs to a different graph builder")
             }
+            Self::EmptyJoin => f.write_str("a join needs at least two source nodes, but has none"),
+            Self::SingleSourceJoin { node } => write!(
+                f,
+                "a join needs at least two source nodes, but only has `{node}`; use a plain edge"
+            ),
+            Self::DuplicateJoinSource { node } => {
+                write!(f, "node `{node}` is listed twice in a join")
+            }
+            Self::JoinToEnd => f.write_str("a join cannot lead to END"),
             Self::DuplicateEdge { edge } => write!(f, "the edge `{edge}` is declared twice"),
             Self::Empty => f.write_str("the graph has no nodes"),
             Self::NoStartEdge => f.write_str("no edge leaves START"),
@@ -94,6 +118,23 @@ mod tests {
                 BuildError::ForeignNode,
                 "the node handle belongs to a different graph builder",
             ),
+            (
+                BuildError::EmptyJoin,
+                "a join needs at least two source nodes, but has none",
+            ),
+            (
+                BuildError::SingleSourceJoin {
+                    node: NodeName::new("plan").unwrap(),
+                },
+                "a join needs at least two source nodes, but only has `plan`; use a plain edge",
+            ),
+            (
+                BuildError::DuplicateJoinSource {
+                    node: NodeName::new("plan").unwrap(),
+                },
+                "node `plan` is listed twice in a join",
+            ),
+            (BuildError::JoinToEnd, "a join cannot lead to END"),
             (
                 BuildError::DuplicateEdge {
                     edge: "plan → END".to_owned(),

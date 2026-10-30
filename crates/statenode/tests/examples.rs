@@ -369,3 +369,102 @@ async fn a_fan_out_merges_its_branches_with_reducers() {
         }
     );
 }
+
+/// A report that two researchers' findings feed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Report {
+    /// The researchers' findings, appended in task-path order.
+    findings: Vec<String>,
+    /// The drafts the writer writes from them, one per run, appended.
+    drafts: Vec<String>,
+}
+
+/// An update to [`Report`]; empty fields leave their channel unwritten.
+#[derive(Debug, Default)]
+struct ReportUpdate {
+    /// Findings to append.
+    findings: Vec<String>,
+    /// A new draft.
+    draft: Option<String>,
+}
+
+impl State for Report {
+    type Update = ReportUpdate;
+
+    fn channels(&self) -> Result<Vec<ChannelSpec>, NameError> {
+        Ok(vec![
+            ChannelSpec::new("findings")?,
+            ChannelSpec::new("drafts")?,
+        ])
+    }
+
+    fn apply_step(
+        &mut self,
+        mut updates: Vec<(TaskPath, ReportUpdate)>,
+    ) -> Result<(), ReduceError> {
+        let findings = updates
+            .iter_mut()
+            .map(|(p, u)| (&*p, mem::take(&mut u.findings)));
+        reducer::append(&mut self.findings, findings);
+        let drafts = updates.iter_mut().map(|(p, u)| (&*p, u.draft.take()));
+        reducer::append(&mut self.drafts, drafts);
+        Ok(())
+    }
+}
+
+/// Two researchers run in parallel, and the writer, joined to both, runs
+/// once, after the slower of them, seeing both findings: one draft is
+/// written, not one per researcher.
+#[tokio::test]
+async fn two_researchers_joined_by_a_writer() {
+    let mut g = GraphBuilder::<Report>::new();
+    let alpha = g
+        .add_node(
+            "alpha",
+            node::from_fn(|_s, _ctx| async move {
+                Ok(Some(ReportUpdate {
+                    findings: vec!["alpha found A".to_owned()],
+                    draft: None,
+                }))
+            }),
+        )
+        .unwrap();
+    let gather = g
+        .add_node("gather", node::from_fn(|_s, _ctx| async move { Ok(()) }))
+        .unwrap();
+    let beta = g
+        .add_node(
+            "beta",
+            node::from_fn(|_s, _ctx| async move {
+                Ok(Some(ReportUpdate {
+                    findings: vec!["beta found B".to_owned()],
+                    draft: None,
+                }))
+            }),
+        )
+        .unwrap();
+    let writer = g
+        .add_node(
+            "writer",
+            node::from_fn(|s: Arc<Report>, _ctx| async move {
+                Ok(Some(ReportUpdate {
+                    findings: Vec::new(),
+                    draft: Some(s.findings.join("; ")),
+                }))
+            }),
+        )
+        .unwrap();
+    // `beta` is one step slower: it gathers first.
+    g.add_edge(START, alpha).unwrap();
+    g.add_edge(START, gather).unwrap();
+    g.add_edge(gather, beta).unwrap();
+    g.add_edge([alpha, beta], writer).unwrap();
+    g.add_edge(writer, END).unwrap();
+    let graph = g.compile().unwrap();
+
+    let report = graph
+        .invoke(ReportUpdate::default(), RunConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(report.drafts, ["alpha found A; beta found B"]);
+}
