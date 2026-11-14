@@ -1,15 +1,26 @@
 # Quality gates for every push to trunk and every pull request.
 #
-# The gates are grouped by toolchain: `check` runs on the MSRV and `nightly`
-# on the pinned nightly. Inside a job, every gate runs even when another gate
-# failed, so one failure never hides another, but no gate runs once setup has
-# failed.
+# Jobs, by check name:
+# - Detect changes: skips the Rust jobs when only Markdown changed.
+# - Check: the MSRV gates.
+# - Format and coverage: the pinned-nightly gates.
+# - Workflows and scripts: actionlint, shellcheck and zizmor.
+# - Commit messages: pull requests only.
 #
-# Branch protection requires exactly these checks, by job name: `Detect
-# changes`, `Check`, `Format and coverage` and `Commit messages`. Renaming a job
-# renames its check, so keep the names stable (and free of versions). A job
-# skipped by its `if:` counts as passing, which is why `Detect changes` itself
-# is required: if it fails, the jobs that depend on it are skipped.
+# Within a job, every gate runs even if another failed.
+#
+# Branch protection:
+# - Requires every check above. A new job's check is added by hand.
+# - A check is named after its job: keep job names stable and free of
+#   versions.
+# - A job skipped by its `if:` passes, so Detect changes is required: if it
+#   fails, its dependents are skipped.
+#
+# Called by nightly-bump.yml (`workflow_call`):
+# - `nightly` overrides `.github/nightly-version`.
+# - The run has the caller's `github` context, `schedule` or
+#   `workflow_dispatch`: its own concurrency group, and no diff to filter, so
+#   every gate runs.
 #
 # AGENTS.md lists the same commands; keep the two in step.
 
@@ -19,12 +30,19 @@ on:
   push:
     branches: [trunk]
   pull_request:
+  workflow_call:
+    inputs:
+      nightly:
+        description: The nightly to format and measure with, overriding .github/nightly-version
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   # Superseded pull request runs are cancelled; every trunk commit gets a verdict.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -49,7 +67,8 @@ jobs:
       # Pull requests list their files through the API.
       pull-requests: read
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+      # Every gate runs when the filter did not.
+      rust: ${{ steps.filter.outcome == 'skipped' && 'true' || steps.filter.outputs.rust }}
     steps:
       # Pushes are diffed with git, `before..trunk`, so the `before` commit
       # must be local.
@@ -59,8 +78,10 @@ jobs:
           persist-credentials: false
       # Skip the Rust jobs when only Markdown changed. `base` and `ref` stay
       # unset: a push to trunk is then diffed against the commit before the
-      # push, and a first push lists every file.
+      # push, and a first push lists every file. Other events, such as a
+      # caller's, have no diff to filter.
       - id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           # A file counts only if it matches every pattern: anything that is
@@ -81,7 +102,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master # zizmor: ignore[ref-version-mismatch]
         with:
           toolchain: 1.94.0
           components: clippy
@@ -126,8 +147,16 @@ jobs:
         with:
           persist-credentials: false
       - id: nightly
-        run: echo "toolchain=$(cat .github/nightly-version)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        env:
+          NIGHTLY_OVERRIDE: ${{ inputs.nightly }}
+        run: |
+          toolchain="${NIGHTLY_OVERRIDE:-$(cat .github/nightly-version)}"
+          if ! [[ "$toolchain" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Not a dated nightly: $toolchain"
+            exit 1
+          fi
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master # zizmor: ignore[ref-version-mismatch]
         with:
           toolchain: ${{ steps.nightly.outputs.toolchain }}
           components: rustfmt, llvm-tools-preview
@@ -153,12 +182,13 @@ jobs:
           # are not unified into the no-default-features build. The package
           # list is computed first, so a failing `cargo metadata` fails the
           # step instead of silently skipping the loop.
-          packages="$(cargo +"$NIGHTLY" metadata --no-deps --format-version 1 | jq -r '.packages[].name')"
-          if [ -z "$packages" ]; then
+          names="$(cargo +"$NIGHTLY" metadata --no-deps --format-version 1 | jq -r '.packages[].name')"
+          if [ -z "$names" ]; then
             echo "no workspace packages found" >&2
             exit 1
           fi
-          for package in $packages; do
+          mapfile -t packages <<<"$names"
+          for package in "${packages[@]}"; do
             cargo +"$NIGHTLY" llvm-cov --branch --no-report --package "$package" --no-default-features
           done
       - name: Report and gate
@@ -176,6 +206,44 @@ jobs:
           name: lcov
           path: lcov.info
           if-no-files-found: ignore
+
+  lint-ci:
+    # Not gated on `changes`: it is cheap, and it guards `.github/` itself.
+    name: Workflows and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: shellcheck,zizmor
+      - id: setup
+        name: Install actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          dir="$RUNNER_TEMP/actionlint"
+          archive="actionlint_${VERSION}_linux_amd64.tar.gz"
+          mkdir -p "$dir"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$dir/$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/${archive}"
+          sha256sum --check --strict <<<"$SHA256  $dir/$archive"
+          tar -xzf "$dir/$archive" -C "$dir" actionlint
+          echo "$dir" >> "$GITHUB_PATH"
+      - name: Workflows lints
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: actionlint
+      - name: Shell script static analysis
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: shellcheck .github/scripts/*.sh
+      - name: Workflow security
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format=github .
 
   commits:
     name: Commit messages
