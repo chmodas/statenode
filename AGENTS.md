@@ -16,6 +16,8 @@ export NIGHTLY="$(cat .github/nightly-version)"
 rustup toolchain install "$NIGHTLY" --profile minimal -c rustfmt,llvm-tools
 ```
 
+The pin is bumped only by the weekly bump pull request from `.github/workflows/nightly-bump.yml`. Its checks start once it is closed and reopened, or pushed to. A bump whose gates fail opens as a draft and is fixed forward on its branch, `ci/nightly-bump`; while it holds a commit a person wrote or amended, the weekly run stops instead of replacing it.
+
 Before considering implementation complete, run every gate exactly as CI does (`.github/workflows/ci.yml`), with `RUSTFLAGS="-D warnings"` exported as CI sets it for every job:
 
 - **Format:** `cargo +"$NIGHTLY" fmt --all --check` (drop `--check` to format)
@@ -25,6 +27,7 @@ Before considering implementation complete, run every gate exactly as CI does (`
 - **Docs:** `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --document-private-items`
 - **Licences and advisories:** `cargo deny check`
 - **Unused dependencies:** `cargo machete`
+- **CI files:** `actionlint`, `shellcheck .github/scripts/*.sh` and `zizmor .`
 
 ## Quality and testing
 

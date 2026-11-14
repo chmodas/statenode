@@ -1,0 +1,13 @@
+# actionlint configuration.
+#
+# `uses: $/…` (GitHub's self-repository syntax) names an action or reusable
+# workflow in this repository at the running commit: it cannot load anything
+# cloned at runtime, and counts as pinned. zizmor flags the older `./…` form.
+#
+# actionlint 1.7.12 does not know `$/` (rhysd/actionlint#711) and reports it as
+# a malformed reference. This ignores exactly that report; every other check
+# still runs. Remove it once actionlint supports the syntax.
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      - '"\$/'

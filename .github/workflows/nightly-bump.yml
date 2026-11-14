@@ -1,0 +1,241 @@
+# Proposes a bump of the nightly pinned in `.github/nightly-version`.
+#
+# Runs weekly, or by hand with an optional `nightly` to propose in place of the
+# newest.
+#
+# Jobs:
+# - `find`: the newest nightly that ships rustfmt and llvm-tools
+#   (.github/scripts/latest-nightly.sh). Stops if the pin is current.
+# - `gates`: ci.yml on trunk with that nightly, through `workflow_call`.
+# - `propose`: commits the pin to `ci/nightly-bump` and opens or updates its
+#   pull request, ready if the gates passed, a draft listing the failures if
+#   not.
+#   - Stops if the branch holds a commit a person wrote or amended.
+#   - Does not push if the branch already proposes this nightly on the
+#     current trunk.
+#
+# The pull request starts no workflows (it is opened with the workflow's
+# token): close and reopen it, or push to it, for the required checks.
+#
+# Requires the repository setting "Allow GitHub Actions to create and approve
+# pull requests".
+#
+# Conventions as in ci.yml: actions pinned by SHA, permissions per job, dynamic
+# values passed to `run:` through `env`.
+
+name: Nightly bump
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: >-
+          A nightly to propose (nightly-YYYY-MM-DD) in place of the newest one,
+          for dry runs; it may be older than the pin, and one that was never
+          published fails the gates
+        type: string
+        required: false
+        default: ''
+
+permissions: {}
+
+concurrency:
+  # A run queued while another is pending replaces it, which a weekly job can
+  # afford.
+  group: nightly-bump
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The branch bumps are based on and proposed to; ci.yml's `push.branches`.
+  BASE: trunk
+  BRANCH: ci/nightly-bump
+
+jobs:
+  find:
+    name: Find the newest nightly
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      nightly: ${{ steps.find.outputs.nightly }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: find
+        env:
+          FORCED: ${{ inputs.nightly }}
+        run: |
+          if [ -n "$FORCED" ]; then
+            if ! [[ "$FORCED" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "::error::Not a dated nightly: $FORCED"
+              exit 1
+            fi
+            candidate="$FORCED"
+          else
+            candidate="$(.github/scripts/latest-nightly.sh)" || {
+              status=$?
+              echo "::error::latest-nightly.sh failed with exit $status; its log says why."
+              exit "$status"
+            }
+          fi
+          pinned="$(cat .github/nightly-version)"
+          if [ "$candidate" = "$pinned" ]; then
+            echo "The pin is current: $pinned" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Candidate: $candidate (pinned: $pinned)" >> "$GITHUB_STEP_SUMMARY"
+            echo "nightly=$candidate" >> "$GITHUB_OUTPUT"
+          fi
+
+  gates:
+    # Its jobs report as `Gates on the candidate nightly / …` checks on the
+    # commit the run is on, trunk's head; they neither satisfy nor block the
+    # required checks.
+    name: Gates on the candidate nightly
+    needs: find
+    if: needs.find.outputs.nightly != ''
+    # A called workflow gets no more than this; ci.yml's `changes` job asks for
+    # `pull-requests: read`.
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: $/.github/workflows/ci.yml
+    with:
+      nightly: ${{ needs.find.outputs.nightly }}
+
+  propose:
+    name: Propose the bump
+    needs: [find, gates]
+    # Only from trunk (`BASE`; `env` is not available here), so a dispatch from
+    # another branch still runs the gates but never bases a bump on it.
+    if: >-
+      ${{ !cancelled() && needs.find.outputs.nightly != ''
+      && github.ref == 'refs/heads/trunk'
+      && (needs.gates.result == 'success' || needs.gates.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # To list the failed jobs.
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      NIGHTLY: ${{ needs.find.outputs.nightly }}
+      VERDICT: ${{ needs.gates.result }}
+      BOT_NAME: github-actions[bot]
+      BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      # The one checkout that keeps its credentials, to push the bump. The job
+      # runs only git and gh, no code from the repository. Full history, so the
+      # bump branch's own commits can be told from trunk's.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: # zizmor: ignore[artipacked] keeps credentials to push the bump
+          fetch-depth: 0
+      - id: guard
+        name: Guard the bump branch
+        run: |
+          # The exact ref: `--heads` would also match `x/ci/nightly-bump`.
+          remote_sha="$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)"
+          current=false
+          if [ -n "$remote_sha" ]; then
+            git fetch --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            # Authors and committers both, so an amended bot commit counts as a
+            # person's; whether or not a pull request is open.
+            emails="$(git log --format='%ae%n%ce' "origin/$BASE..origin/$BRANCH")"
+            if [ -n "$emails" ] && grep -qvxF "$BOT_EMAIL" <<<"$emails"; then
+              echo "::error::$BRANCH holds a commit by a person (a fix forward in progress); merge its pull request, or delete the branch, first."
+              exit 1
+            fi
+            if [ "$(git rev-parse "origin/$BRANCH^")" = "$(git rev-parse "origin/$BASE")" ] \
+              && [ "$(git show "origin/$BRANCH:.github/nightly-version")" = "$NIGHTLY" ]; then
+              current=true
+            fi
+          fi
+          # This repository's own branch only, never a fork's of the same name.
+          pull="$(gh pr list --head "$BRANCH" --base "$BASE" --state open \
+            --json number,isDraft,isCrossRepository \
+            --jq 'map(select(.isCrossRepository | not)) | .[0] // empty')"
+          number=""
+          draft=""
+          if [ -n "$pull" ]; then
+            number="$(jq -r '.number' <<<"$pull")"
+            draft="$(jq -r '.isDraft' <<<"$pull")"
+          fi
+          {
+            echo "remote_sha=$remote_sha"
+            echo "current=$current"
+            echo "number=$number"
+            echo "draft=$draft"
+          } >> "$GITHUB_OUTPUT"
+      - name: Commit and push the pin
+        # A rerun for the nightly the branch already proposes on the current
+        # trunk keeps its commit, and the checks a person started on it.
+        if: steps.guard.outputs.current == 'false'
+        env:
+          REMOTE_SHA: ${{ steps.guard.outputs.remote_sha }}
+        run: |
+          git switch -C "$BRANCH"
+          printf '%s\n' "$NIGHTLY" > .github/nightly-version
+          git add .github/nightly-version
+          git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" \
+            commit -m "ci: Bump the pinned nightly to $NIGHTLY"
+          # The lease fails the push if the branch moved since the guard; an
+          # empty SHA means it must not exist yet.
+          git push --force-with-lease="$BRANCH:$REMOTE_SHA" origin "$BRANCH"
+      - name: Write the description
+        run: |
+          body="$RUNNER_TEMP/body.md"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Bumps the pinned nightly to \`$NIGHTLY\`."
+            echo
+            if [ "$VERDICT" = success ]; then
+              echo "The gates passed on it in [this run]($run_url)."
+            else
+              echo "The gates failed on it in [this run]($run_url):"
+              echo
+              # A failed lookup must not keep the pull request from opening.
+              gh run view "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --json jobs --jq '
+                .jobs[] | select(.conclusion == "failure")
+                | "- [\(.name)](\(.url))"
+                  + ([(.steps // [])[] | select(.conclusion == "failure") | "\n  - \(.name)"] | join(""))' \
+                || echo "- The failed jobs could not be listed; see the run."
+              echo
+              echo "Fix it forward by pushing to \`$BRANCH\`."
+            fi
+            echo
+            echo "Pull requests opened by this workflow start no checks: close and"
+            echo "reopen this one, or push to it, so the required checks report."
+            echo "Each new bump commit force-pushed here needs this again."
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+      - name: Open or update the pull request
+        env:
+          NUMBER: ${{ steps.guard.outputs.number }}
+          DRAFT: ${{ steps.guard.outputs.draft }}
+        run: |
+          body="$RUNNER_TEMP/body.md"
+          title="ci: Bump the pinned nightly to $NIGHTLY"
+          if [ -z "$NUMBER" ]; then
+            draft=()
+            if [ "$VERDICT" != success ]; then
+              draft=(--draft)
+            fi
+            gh pr create --base "$BASE" --head "$BRANCH" --title "$title" \
+              --body-file "$body" "${draft[@]}"
+            exit 0
+          fi
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$NUMBER" \
+            -f title="$title" -F body=@"$body" > /dev/null
+          if [ "$VERDICT" = success ] && [ "$DRAFT" = true ]; then
+            gh pr ready "$NUMBER"
+          elif [ "$VERDICT" != success ] && [ "$DRAFT" = false ]; then
+            gh pr ready "$NUMBER" --undo
+          fi
